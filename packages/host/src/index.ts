@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { loadConfig } from './config.js';
+import { batchSummaryLine, CompletionLedger, defaultDataDir, FailedLedger, mergeIntoQueueFile, planNextPass, type ScrapeFn, type WatchOutcome } from './batch.js';
 import { captureFromWs, defaultCorpusDir, listCaptures, loadCapture, qualityCheck, saveCapture, wsCaptureTransport } from './capture.js';
 import { CdpTab } from './cdp.js';
 import { distillRecipe } from './distill.js';
@@ -21,14 +23,17 @@ const USAGE = `c4g host — unattended LMS supervisor
 Usage:
   tsx src/index.ts watch   [--url SUBSTR] [--queue 1,2,3]
   tsx src/index.ts quiz    [--url SUBSTR]
-  tsx src/index.ts chain   <courseUrl> [--queue 1,2,3]
+  tsx src/index.ts chain   <courseUrl> [--queue 1,2,3] [--loop] [--max-passes N]
   tsx src/index.ts inspect [--url SUBSTR | --from FILE] [--learn]
   tsx src/index.ts corpus  list | corpus show <captureId>
 
 Commands:
   watch    attach the timekeeper to a matching tab (queue from --queue or course scrape)
   quiz     run the quiz loop once on a matching tab (capture → inspect → answer)
-  chain    navigate the tab to a course page, scrape video ids, supervise
+  chain    navigate the tab to a course page, scrape video ids, supervise;
+           --loop rescrapes the course after each drain and retries incomplete
+           videos until done or --max-passes (default 3) — overnight batch
+             completions land in data/completions.json, retry counts in data/failed.json
   inspect  capture + inspect a quiz page (live tab, or a saved capture via --from);
            --learn distills a per-origin recipe when the inspection is green (live only)
   corpus   list saved page captures / show one capture's detail`;
@@ -38,6 +43,8 @@ interface CliArgs {
   queue?: number[];
   from?: string;
   learn?: boolean;
+  loop?: boolean;
+  maxPasses?: number;
   positional: string[];
 }
 
@@ -48,6 +55,8 @@ function parseArgs(argv: string[]): CliArgs {
     else if (argv[i] === '--queue') args.queue = (argv[++i] ?? '').split(',').map(Number).filter(Number.isFinite);
     else if (argv[i] === '--from') args.from = argv[++i];
     else if (argv[i] === '--learn') args.learn = true;
+    else if (argv[i] === '--loop') args.loop = true;
+    else if (argv[i] === '--max-passes') args.maxPasses = Math.max(1, Number(argv[++i] ?? 3) || 3);
     else args.positional.push(argv[i]);
   }
   return args;
@@ -157,6 +166,80 @@ async function corpusCmd(args: CliArgs): Promise<void> {
   process.exit(1);
 }
 
+/** Set by chain --loop; the shared SIGINT handler flushes batch state before exit. */
+let persistOnShutdown: (() => void) | null = null;
+
+/**
+ * chain --loop: overnight batch supervisor. Passes = course rescrape + ledger
+ * diff; each video runs to a terminal WatchOutcome under real 1x playback.
+ * Completions land in data/completions.json, retry counts in data/failed.json
+ * (exhausted videos are skipped by later passes). No queue item is ever
+ * started twice within a run.
+ */
+async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: number; cdp: CdpTab }): Promise<void> {
+  const dataDir = defaultDataDir();
+  const ledger = new CompletionLedger(join(dataDir, 'completions.json'));
+  const failed = new FailedLedger(join(dataDir, 'failed.json'));
+  ledger.load();
+  failed.load();
+  const queueFile = join(dataDir, 'queue.json');
+
+  // Scrape is read-only: navigate the tab to the course page and list video ids.
+  const scrape: ScrapeFn = async (url) => {
+    await live.cdp.navigate(url);
+    const ids = await moodleVideo.scrapeCourseVideoIds(live.cdp);
+    return ids.map((id) => ({ url: `/mod/fsresource/view.php?id=${id}`, resourceId: id }));
+  };
+
+  persistOnShutdown = () => {
+    ledger.flush();
+    failed.flush();
+  };
+
+  const maxPasses = args.maxPasses ?? 3;
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    const planned = await planNextPass({ courseUrl, scrape, ledger, failed });
+    if (planned.length === 0) {
+      log('info', `batch: pass ${pass}/${maxPasses} — nothing left to watch, course complete`);
+      log('info', batchSummaryLine(ledger, failed));
+      return;
+    }
+    log('info', `batch: pass ${pass}/${maxPasses} — ${planned.length} video(s) to watch`);
+    mergeIntoQueueFile(
+      queueFile,
+      planned.map((item) => Number(item.resourceId)).filter(Number.isFinite),
+    );
+
+    for (const item of planned) {
+      if (typeof item.resourceId !== 'number') {
+        log('warn', `batch: skipping item without numeric resourceId: ${item.url.slice(0, 100)}`);
+        continue;
+      }
+      const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform: moodleVideo, log });
+      // CONTRACT: start() resolves WatchOutcome at the video's terminal state
+      // (recovery lane). Pre-merge it returns void — the unknown-cast keeps
+      // this compiling and the guard below keeps the loop inert; integrator
+      // drops the cast once timekeeper.ts exports the type.
+      const outcome = (await timekeeper.start([item.resourceId])) as unknown as WatchOutcome | undefined;
+      if (!outcome) {
+        log('warn', 'batch: WatchOutcome contract not landed in timekeeper yet — stopping batch loop (integration pending)');
+        return;
+      }
+      if (outcome.completed) {
+        ledger.record(outcome.resourceId, outcome.creditedDeltaSeconds);
+        log('info', `batch: video ${outcome.resourceId} completed (credited ${outcome.creditedDeltaSeconds ?? '?'}s, ${outcome.wallSeconds.toFixed(0)}s wall, ${outcome.recoveries} recoveries)`);
+      } else if (outcome.failed) {
+        failed.recordFailed(outcome.resourceId, 'recovery cap exceeded');
+        log('warn', `batch: video ${outcome.resourceId} failed after ${outcome.recoveries} recoveries — will retry next pass`);
+      } else {
+        log('info', `batch: video ${outcome.resourceId} stopped before terminal state — will retry next pass`);
+      }
+    }
+  }
+  log('warn', `batch: reached --max-passes (${maxPasses}) with videos remaining`);
+  log('info', batchSummaryLine(ledger, failed));
+}
+
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   if (!cmd || cmd === 'help' || cmd === '--help') {
@@ -186,10 +269,12 @@ async function main(): Promise<void> {
     bridge.close();
     cdp.close();
   };
+  // chain --loop flushes batch ledgers here before the process exits (130 = SIGINT).
   process.once('SIGINT', () => {
     log('info', 'shutting down…');
+    persistOnShutdown?.();
     cleanup();
-    process.exit(0);
+    process.exit(persistOnShutdown ? 130 : 0);
   });
 
   switch (cmd) {
@@ -202,6 +287,10 @@ async function main(): Promise<void> {
           process.exit(1);
         }
         await cdp.navigate(courseUrl);
+        if (args.loop) {
+          await runChainLoop(args, courseUrl, { tabId, cdp });
+          break;
+        }
       }
       let queue = args.queue;
       if (!queue || queue.length === 0) {
