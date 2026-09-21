@@ -226,7 +226,15 @@ export interface BatchLoopDeps {
  */
 export async function runBatchLoop(deps: BatchLoopDeps): Promise<void> {
   for (let pass = 1; pass <= deps.maxPasses; pass++) {
-    const planned = await deps.plan();
+    let planned: ScrapeItem[];
+    try {
+      planned = await deps.plan();
+    } catch (err) {
+      // F2 (review): one transient CDP/navigation failure must not kill the
+      // whole overnight run — log it and let the next pass retry.
+      deps.log('error', `batch: pass ${pass}/${deps.maxPasses} plan failed — will retry next pass: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
     if (planned.length === 0) {
       deps.log('info', `batch: pass ${pass}/${deps.maxPasses} — nothing left to watch, course complete`);
       deps.log('info', batchSummaryLine(deps.ledger, deps.failed));

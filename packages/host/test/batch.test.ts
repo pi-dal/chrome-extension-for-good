@@ -284,3 +284,37 @@ describe('runBatchLoop', () => {
     assert.ok(logs.some((l) => l.includes('--max-passes (2)')));
   });
 });
+
+describe('runBatchLoop error isolation', () => {
+  it('survives a failing pass plan and retries on the next pass (review F2)', async () => {
+    const io = makeIo();
+    const ledger = new CompletionLedger(join(tmp, 'loop-comp3.json'), io);
+    const failed = new FailedLedger(join(tmp, 'loop-fail3.json'), io);
+    ledger.load();
+    failed.load();
+    let planCalls = 0;
+    const watched: number[] = [];
+    const logs: string[] = [];
+    await runBatchLoop({
+      maxPasses: 3,
+      plan: async () => {
+        planCalls += 1;
+        if (planCalls === 1) throw new Error('cdp navigation timed out');
+        if (planCalls === 2) return [{ url: '/mod/fsresource/view.php?id=7', resourceId: 7 }];
+        return [];
+      },
+      watch: async (id) => {
+        watched.push(id);
+        return { resourceId: id, completed: true, failed: false, wallSeconds: 30, creditedDeltaSeconds: 120, recoveries: 0 };
+      },
+      ledger,
+      failed,
+      log: (level, msg) => logs.push(`${level}:${msg}`),
+    });
+    assert.equal(planCalls, 3);
+    assert.deepEqual(watched, [7]); // first pass failure did not kill the run
+    assert.equal(ledger.has(7), true);
+    assert.ok(logs.some((l) => l.includes('plan failed') && l.includes('will retry next pass')));
+    assert.ok(logs.some((l) => l.includes('course complete')));
+  });
+});
