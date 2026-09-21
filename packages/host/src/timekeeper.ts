@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { Action, ElementTable, Rect } from '@c4g/protocol';
+import type { Rect } from '@c4g/protocol';
 import type { JevDecision, JeDriver } from './jev.js';
 import type { LogFn } from './log.js';
 import type { PlayerState } from './platforms/moodle-video.js';
@@ -31,13 +31,26 @@ export interface TimekeeperDeps {
   log: LogFn;
   intervalMs?: number;
   dataFile?: string;
+  /** Stall-recovery attempts per video before giving up (default 3). */
+  maxRecovery?: number;
+}
+
+/** Outcome of supervising one video to a terminal state. */
+export interface WatchOutcome {
+  resourceId: string | number; // fsresourceid from playerdata
+  completed: boolean; // player reached end AND server totaltime confirms final credit
+  failed: boolean; // exceeded maxRecovery recoveries; gave up on this video
+  wallSeconds: number; // wall-clock seconds spent on this video
+  creditedDeltaSeconds: number | null; // server totaltime delta observed; null if unverifiable
+  recoveries: number; // stall-recovery attempts used
 }
 
 export type TickOutcome =
   | { kind: 'navigate'; id: number }
   | { kind: 'resume'; action: string }
   | { kind: 'resume-blocked' }
-  | { kind: 'stall-warned' }
+  | { kind: 'recover'; stage: 'in-page' | 'reload'; attempt: number }
+  | { kind: 'abandon'; id: number }
   | { kind: 'none'; detail: string }
   | { kind: 'idle'; detail: string };
 
@@ -48,6 +61,22 @@ interface PersistedQueue {
   queue: number[];
   done: number[];
 }
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/** Ticks to observe after a recovery attempt before re-judging the stall. */
+const GRACE_TICKS = 2;
 
 function defaultDataFile(): string {
   return resolve(HERE, '..', 'data', 'queue.json');
@@ -71,24 +100,39 @@ function idFromUrl(url: string): number | null {
  * playback, and NEVER runs videos concurrently. It only:
  *   - keeps the current video genuinely playing at 1x (auto-dismiss dialogs
  *     via snapshot + Jev),
- *   - verifies server-credited totaltime keeps advancing (warn only),
+ *   - on server-credit stalls: attempts bounded recovery (in-page resume,
+ *     then page reload + resume) — never by forging requests or speeding up
+ *     playback — and gives up on the video after maxRecovery attempts,
+ *   - verifies server-credited totaltime keeps advancing (read-back only),
  *   - chains to the next queued video when one finishes.
  */
 export class Timekeeper {
   private queue: number[] = [];
   private readonly done = new Set<number>();
+  private readonly gaveUp = new Set<number>();
   private consecutiveNotPlaying = 0;
   private lastTotalTime: number | null = null;
   private ticksAtSameTotalTime = 0;
-  private stallWarned = false;
   private timer: NodeJS.Timeout | null = null;
   private readonly dataFile: string;
   private running = false;
   private ringInstalled = false;
   private genericHeartbeatReported = false;
+  // --- stall recovery + per-video accounting
+  private stallRecoveries = 0;
+  private graceTicks = 0;
+  private videoStartedAt: number | null = null;
+  private firstCredited: number | null = null;
+  private lastCredited: number | null = null;
+  private readonly pending = new Map<number, Deferred<WatchOutcome>>();
+  private readonly summary: WatchOutcome[] = [];
 
   constructor(private readonly deps: TimekeeperDeps) {
     this.dataFile = deps.dataFile ?? defaultDataFile();
+  }
+
+  private get maxRecovery(): number {
+    return this.deps.maxRecovery ?? 3;
   }
 
   // ---------------------------------------------------------------- persistence
@@ -119,7 +163,7 @@ export class Timekeeper {
   setQueue(queue: number[]): void {
     this.queue = [...queue];
     this.loadPersisted();
-    this.queue = this.queue.filter((id) => !this.done.has(id));
+    this.queue = this.queue.filter((id) => !this.done.has(id) && !this.gaveUp.has(id));
     this.persist();
   }
 
@@ -144,26 +188,83 @@ export class Timekeeper {
     this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    // Interrupted watches resolve as failed so no caller promise hangs.
+    for (const [id, d] of this.pending) {
+      const outcome: WatchOutcome = {
+        resourceId: id,
+        completed: false,
+        failed: true,
+        wallSeconds: this.videoStartedAt ? Math.round((Date.now() - this.videoStartedAt) / 1000) : 0,
+        creditedDeltaSeconds: null,
+        recoveries: this.stallRecoveries,
+      };
+      this.summary.push(outcome);
+      d.resolve(outcome);
+    }
+    this.pending.clear();
     this.deps.log('info', 'timekeeper: stopped');
+  }
+
+  // ------------------------------------------------------------- per-video API
+
+  /**
+   * Supervise one video until it reaches a terminal state and resolve with its
+   * WatchOutcome. Safe to call for an id that already finished (resolves
+   * immediately as completed). Does not reject — failures resolve with
+   * failed=true after maxRecovery exhausted recovery attempts.
+   */
+  async watch(id: number): Promise<WatchOutcome> {
+    if (this.done.has(id)) {
+      const outcome: WatchOutcome = {
+        resourceId: id,
+        completed: true,
+        failed: false,
+        wallSeconds: 0,
+        creditedDeltaSeconds: null,
+        recoveries: 0,
+      };
+      this.summary.push(outcome);
+      this.deps.log('info', `timekeeper: ${id} completed credited=?/recovered=0 (already done)`);
+      return outcome;
+    }
+    const existing = this.pending.get(id);
+    if (existing) return existing.promise;
+    const d = deferred<WatchOutcome>();
+    this.pending.set(id, d);
+    if (!this.running) {
+      this.start([id, ...this.queue]);
+    } else {
+      this.queue = Array.from(new Set([id, ...this.queue]));
+      this.persist();
+      void this.tick().catch((err: unknown) => {
+        this.deps.log('error', `timekeeper tick failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
+    return d.promise;
+  }
+
+  /** All outcomes recorded this process, in completion order. */
+  runSummary(): WatchOutcome[] {
+    return [...this.summary];
   }
 
   // ---------------------------------------------------------------------- tick
 
   /** One supervision step. Public for tests; start() drives it on an interval. */
   async tick(): Promise<TickOutcome> {
-    const { cdp, ws, jev, platform, log, tabId } = this.deps;
+    const { cdp, platform, log } = this.deps;
     const url = await cdp.url();
 
     // Not on a video page → move to the next queued video.
     if (!platform.isVideoPage(url)) {
-      const next = this.queue.find((id) => !this.done.has(id));
+      const next = this.queue.find((id) => !this.done.has(id) && !this.gaveUp.has(id));
       if (next === undefined) {
         return { kind: 'idle', detail: 'queue empty — all videos done' };
       }
       log('info', `timekeeper: navigating to video ${next}`);
       await cdp.navigate(videoUrl(next));
       await platform.installHeartbeatHook(cdp);
-      this.resetPlaybackWatch();
+      this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
     }
 
@@ -182,24 +283,11 @@ export class Timekeeper {
       if (this.consecutiveNotPlaying < 2) {
         return { kind: 'none', detail: `paused (tick ${this.consecutiveNotPlaying})` };
       }
-      const { table } = await ws.snapshot(tabId, { quizOnly: false });
-      const decision: JevDecision = await jev.decide(GOAL_RESUME, table);
-      if (decision.operation === 'CLICK' && decision.targetIndex !== undefined) {
-        const el = table.elements.find((e) => e.index === decision.targetIndex);
-        const action: Action = { op: 'click', index: decision.targetIndex };
-        log('info', `timekeeper: resuming via [${decision.targetIndex}] "${el?.name.slice(0, 60) ?? '?'}"`);
-        await ws.act(tabId, action);
+      const resumed = await this.resumeAttempt();
+      if (resumed) {
         this.consecutiveNotPlaying = 0;
-        return { kind: 'resume', action: `click #${decision.targetIndex}` };
+        return { kind: 'resume', action: 'jev click' };
       }
-      log(
-        'warn',
-        `timekeeper: paused but no actionable element (${decision.operation}) — table excerpt:\n` +
-          table.elements
-            .slice(0, 12)
-            .map((e) => `  [${e.index}] ${e.role} "${e.name.slice(0, 50)}"`)
-            .join('\n'),
-      );
       this.consecutiveNotPlaying = 0;
       return { kind: 'resume-blocked' };
     }
@@ -213,22 +301,61 @@ export class Timekeeper {
       await this.observeGenericHeartbeat();
     }
     if (state.totaltime !== null) {
+      if (this.firstCredited === null) this.firstCredited = state.totaltime;
+      this.lastCredited = state.totaltime;
       if (this.lastTotalTime !== null && state.totaltime === this.lastTotalTime) {
         this.ticksAtSameTotalTime++;
       } else {
         this.ticksAtSameTotalTime = 0;
-        this.stallWarned = false;
       }
       this.lastTotalTime = state.totaltime;
-      if (this.ticksAtSameTotalTime >= 4 && !this.stallWarned) {
-        this.stallWarned = true;
-        log(
-          'warn',
-          `timekeeper: server totaltime (${state.totaltime}s) unchanged across 4 ticks while playing — ` +
-            'server may not be crediting time. Investigate manually; do NOT forge heartbeats.',
-        );
-        return { kind: 'stall-warned' };
+    }
+    if (this.videoStartedAt === null) this.videoStartedAt = Date.now();
+
+    // Server-credit stall → bounded recovery (never by forging or speeding up).
+    // Requires a parseable video id for per-video accounting; otherwise fall through.
+    if (state.totaltime !== null && currentId !== null && this.ticksAtSameTotalTime >= 4) {
+      if (this.graceTicks > 0) {
+        this.graceTicks--;
+        return { kind: 'none', detail: `recovery grace (${this.graceTicks} ticks left)` };
       }
+      if (this.stallRecoveries >= this.maxRecovery) {
+        // Give up on this video: resolve as failed and move on (no throw).
+        const id = currentId;
+        log(
+          'error',
+          `timekeeper: video ${id} still stalled after ${this.stallRecoveries} recovery attempts — giving up. ` +
+            'Server may not be crediting time; investigate manually. do NOT forge heartbeats.',
+        );
+        this.gaveUp.add(id);
+        this.queue = this.queue.filter((qid) => qid !== id);
+        this.persist();
+        this.recordOutcome(id, { completed: false, failed: true });
+        const next = this.queue.find((qid) => !this.done.has(qid) && !this.gaveUp.has(qid));
+        if (next === undefined) {
+          this.stop();
+          return { kind: 'idle', detail: 'queue drained (with failures)' };
+        }
+        await cdp.navigate(videoUrl(next));
+        await platform.installHeartbeatHook(cdp);
+        this.resetPlaybackWatch(true);
+        return { kind: 'abandon', id };
+      }
+      this.stallRecoveries++;
+      const stage: 'in-page' | 'reload' = this.stallRecoveries === 1 ? 'in-page' : 'reload';
+      if (stage === 'in-page') {
+        log('warn', `timekeeper: totaltime stalled at ${state.totaltime}s — recovery #${this.stallRecoveries}: in-page resume attempt`);
+        await this.resumeAttempt();
+      } else {
+        log('warn', `timekeeper: totaltime stalled at ${state.totaltime}s — recovery #${this.stallRecoveries}: reloading video page`);
+        const currentUrl = await cdp.url();
+        await cdp.navigate(currentUrl);
+        await platform.installHeartbeatHook(cdp);
+        this.resetPlaybackWatch(false);
+      }
+      this.ticksAtSameTotalTime = 0;
+      this.graceTicks = GRACE_TICKS;
+      return { kind: 'recover', stage, attempt: this.stallRecoveries };
     }
 
     // Finished → mark done, chain to next.
@@ -242,7 +369,8 @@ export class Timekeeper {
       this.done.add(currentId);
       this.queue = this.queue.filter((id) => id !== currentId);
       this.persist();
-      const next = this.queue.find((id) => !this.done.has(id));
+      this.recordOutcome(currentId, { completed: true, failed: false });
+      const next = this.queue.find((id) => !this.done.has(id) && !this.gaveUp.has(id));
       if (next === undefined) {
         log('info', 'timekeeper: all videos done 🎉');
         this.stop();
@@ -250,21 +378,74 @@ export class Timekeeper {
       }
       await cdp.navigate(videoUrl(next));
       await platform.installHeartbeatHook(cdp);
-      this.resetPlaybackWatch();
+      this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
     }
 
     return { kind: 'none', detail: `playing ${state.currentTime.toFixed(0)}/${state.duration.toFixed(0)}s totaltime=${state.totaltime ?? '?'}` };
   }
 
-  private resetPlaybackWatch(): void {
+  private resetPlaybackWatch(newVideo: boolean): void {
     this.consecutiveNotPlaying = 0;
     this.lastTotalTime = null;
     this.ticksAtSameTotalTime = 0;
-    this.stallWarned = false;
+    this.graceTicks = 0;
+    this.firstCredited = null;
+    this.lastCredited = null;
+    this.videoStartedAt = Date.now();
+    if (newVideo) this.stallRecoveries = 0;
     // A new page is a fresh JS world: the ring buffer must be re-installed.
     this.ringInstalled = false;
     this.genericHeartbeatReported = false;
+  }
+
+  /**
+   * One resume attempt through the existing trusted path: snapshot + Jev
+   * decide + act click. Returns whether an actionable element was clicked.
+   */
+  private async resumeAttempt(): Promise<boolean> {
+    const { tabId, ws, jev, log } = this.deps;
+    const { table } = await ws.snapshot(tabId, { quizOnly: false });
+    const decision: JevDecision = await jev.decide(GOAL_RESUME, table);
+    if (decision.operation === 'CLICK' && decision.targetIndex !== undefined) {
+      const el = table.elements.find((e) => e.index === decision.targetIndex);
+      log('info', `timekeeper: resuming via [${decision.targetIndex}] "${el?.name.slice(0, 60) ?? '?'}"`);
+      await ws.act(tabId, { op: 'click', index: decision.targetIndex });
+      return true;
+    }
+    log(
+      'warn',
+      `timekeeper: paused but no actionable element (${decision.operation}) — table excerpt:\n` +
+        table.elements
+          .slice(0, 12)
+          .map((e) => `  [${e.index}] ${e.role} "${e.name.slice(0, 50)}"`)
+          .join('\n'),
+    );
+    return false;
+  }
+
+  /** Build, log, record, and deliver the terminal outcome for a video. */
+  private recordOutcome(id: number, terminal: { completed: boolean; failed: boolean }): void {
+    const outcome: WatchOutcome = {
+      resourceId: id,
+      completed: terminal.completed,
+      failed: terminal.failed,
+      wallSeconds: this.videoStartedAt !== null ? Math.round((Date.now() - this.videoStartedAt) / 1000) : 0,
+      creditedDeltaSeconds:
+        this.firstCredited !== null && this.lastCredited !== null ? this.lastCredited - this.firstCredited : null,
+      recoveries: this.stallRecoveries,
+    };
+    this.summary.push(outcome);
+    this.deps.log(
+      terminal.failed ? 'error' : 'info',
+      `timekeeper: ${id} ${terminal.failed ? 'failed' : 'completed'} ` +
+        `credited=${outcome.creditedDeltaSeconds ?? '?'}/recovered=${outcome.recoveries}`,
+    );
+    const d = this.pending.get(id);
+    if (d) {
+      this.pending.delete(id);
+      d.resolve(outcome);
+    }
   }
 
   /**
