@@ -4,22 +4,6 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/**
- * LOCAL CONTRACT SHADOW (integration note): the recovery lane lands the real
- * `WatchOutcome` export in timekeeper.ts; until that merge, batch.ts declares
- * the identical shape so the chain loop can code against the contract.
- * Structural typing keeps both declarations compatible — integrator should
- * re-point the chain loop import at the timekeeper export.
- */
-export interface WatchOutcome {
-  resourceId: string | number;         // fsresourceid from playerdata
-  completed: boolean;                  // player reached end AND server totaltime confirms final credit
-  failed: boolean;                     // exceeded maxRecovery recoveries; gave up on this video
-  wallSeconds: number;                 // wall-clock seconds spent on this video
-  creditedDeltaSeconds: number | null; // server totaltime delta observed; null if unverifiable
-  recoveries: number;                  // stall-recovery attempts used
-}
-
 /** Injectable filesystem + clock seam (tests point this at a temp dir). */
 export interface LedgerIO {
   exists(path: string): boolean;

@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from './config.js';
-import { batchSummaryLine, CompletionLedger, defaultDataDir, FailedLedger, mergeIntoQueueFile, planNextPass, type ScrapeFn, type WatchOutcome } from './batch.js';
+import { batchSummaryLine, CompletionLedger, defaultDataDir, FailedLedger, mergeIntoQueueFile, planNextPass, type ScrapeFn } from './batch.js';
 import { captureFromWs, defaultCorpusDir, listCaptures, loadCapture, qualityCheck, saveCapture, wsCaptureTransport } from './capture.js';
 import { CdpTab } from './cdp.js';
 import { distillRecipe } from './distill.js';
@@ -216,15 +216,9 @@ async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: num
         continue;
       }
       const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform: moodleVideo, log });
-      // CONTRACT: start() resolves WatchOutcome at the video's terminal state
-      // (recovery lane). Pre-merge it returns void — the unknown-cast keeps
-      // this compiling and the guard below keeps the loop inert; integrator
-      // drops the cast once timekeeper.ts exports the type.
-      const outcome = (await timekeeper.start([item.resourceId])) as unknown as WatchOutcome | undefined;
-      if (!outcome) {
-        log('warn', 'batch: WatchOutcome contract not landed in timekeeper yet — stopping batch loop (integration pending)');
-        return;
-      }
+      // CONTRACT: watch() supervises one video to terminal state and resolves
+      // its WatchOutcome (never rejects; failed=true after maxRecovery).
+      const outcome = await timekeeper.watch(item.resourceId);
       if (outcome.completed) {
         ledger.record(outcome.resourceId, outcome.creditedDeltaSeconds);
         log('info', `batch: video ${outcome.resourceId} completed (credited ${outcome.creditedDeltaSeconds ?? '?'}s, ${outcome.wallSeconds.toFixed(0)}s wall, ${outcome.recoveries} recoveries)`);

@@ -34,6 +34,8 @@ pnpm --filter @c4g/protocol test
 - 启动 Chrome 调试端口:`open -a "Google Chrome" --args --remote-debugging-port=9222`
 - host:`cp .env.example .env` 填入 key 后 `pnpm --filter @c4g/host dev`(无 key 时自动进入 dry-run,只记录决策不调用外部 API)
 - **端点配置可在扩展侧热更新**:扩展 options 页可填解题 LLM 与 TypeSafe(Jev)的 Base URL / API Key / Model,保存后经 `config_sync` 推送给 host 运行时生效(留空 = 回落 `.env` 默认值)。密钥仅存本机 `chrome.storage.local`,仅经 loopback WebSocket 发送给 host 进程,日志永不打印密钥。
+- **过夜批跑**:`pnpm --filter @c4g/host dev chain <课程页URL> --loop` —— 队列清空后自动重扫课程页,按完成台账(`data/completions.json`)去重补队列,直到全部看完或 `--max-passes N`(默认 3)用尽;Ctrl-C 先持久化队列与台账再退出。失败重试记录在 `data/failed.json`(封顶,防死循环)。
+- **断流自愈**:播放中若服务端记账时长停滞,先页内恢复(弹窗处理),再自动重载页面并恢复真实播放;每视频最多重试 3 次,超限标记失败并自动切下一个,结束后输出每视频账目(时长/记账/恢复次数)。
 
 ## 安全边界(硬约束)
 
