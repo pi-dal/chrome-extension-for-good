@@ -277,3 +277,21 @@ describe('Timekeeper watch() re-arm', () => {
     assert.equal(second.failed, false);
   });
 });
+
+describe('Timekeeper never-played bound', () => {
+  it('abandons a video that never starts playing instead of hanging forever (review F3)', async () => {
+    const h = makeHarness({ playing: false, currentTime: 0, totaltime: 0, duration: 6000 });
+    // Resume attempts never find an actionable element.
+    h.deps.jev = { decide: async () => ({ operation: 'BLOCKED', confidence: 0.5, dryRun: true }) };
+    h.deps.maxNotPlayingTicks = 4;
+    const tk = new Timekeeper(h.deps);
+    const p = tk.watch(101);
+    for (let i = 0; i < 12; i++) {
+      const o = await tk.tick();
+      if (o.kind === 'idle') break; // abandoned video drained the queue
+    }
+    const outcome = await p; // must resolve, never reject, never hang
+    assert.equal(outcome.failed, true);
+    assert.equal(outcome.completed, false);
+  });
+});

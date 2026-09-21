@@ -33,6 +33,8 @@ export interface TimekeeperDeps {
   dataFile?: string;
   /** Stall-recovery attempts per video before giving up (default 3). */
   maxRecovery?: number;
+  /** Give up on a video after this many consecutive never-played ticks (review F3). */
+  maxNotPlayingTicks?: number;
 }
 
 /** Outcome of supervising one video to a terminal state. */
@@ -133,6 +135,10 @@ export class Timekeeper {
 
   private get maxRecovery(): number {
     return this.deps.maxRecovery ?? 3;
+  }
+
+  private get maxNotPlayingTicks(): number {
+    return this.deps.maxNotPlayingTicks ?? 6;
   }
 
   // ---------------------------------------------------------------- persistence
@@ -293,7 +299,18 @@ export class Timekeeper {
         this.consecutiveNotPlaying = 0;
         return { kind: 'resume', action: 'jev click' };
       }
-      this.consecutiveNotPlaying = 0;
+      // F3 (review): a page that never starts playing must not block the run
+      // forever — the stall path below never fires while paused (no totaltime
+      // progression to compare), so enforce its own bound here. The counter is
+      // deliberately NOT reset on resume-blocked ticks.
+      if (this.consecutiveNotPlaying >= this.maxNotPlayingTicks) {
+        const id = idFromUrl(url);
+        if (id !== null) {
+          return await this.abandonVideo(id, `never started playing after ${this.consecutiveNotPlaying} ticks`);
+        }
+        // Unattributable page (no parseable id): keep trying, cannot record.
+        this.consecutiveNotPlaying = 0;
+      }
       return { kind: 'resume-blocked' };
     }
 
@@ -327,24 +344,10 @@ export class Timekeeper {
       if (this.stallRecoveries >= this.maxRecovery) {
         // Give up on this video: resolve as failed and move on (no throw).
         const id = currentId;
-        log(
-          'error',
-          `timekeeper: video ${id} still stalled after ${this.stallRecoveries} recovery attempts — giving up. ` +
-            'Server may not be crediting time; investigate manually. do NOT forge heartbeats.',
+        return await this.abandonVideo(
+          id,
+          `still stalled after ${this.stallRecoveries} recovery attempts — server may not be crediting time; investigate manually`,
         );
-        this.gaveUp.add(id);
-        this.queue = this.queue.filter((qid) => qid !== id);
-        this.persist();
-        this.recordOutcome(id, { completed: false, failed: true });
-        const next = this.queue.find((qid) => !this.done.has(qid) && !this.gaveUp.has(qid));
-        if (next === undefined) {
-          this.stop();
-          return { kind: 'idle', detail: 'queue drained (with failures)' };
-        }
-        await cdp.navigate(videoUrl(next));
-        await platform.installHeartbeatHook(cdp);
-        this.resetPlaybackWatch(true);
-        return { kind: 'abandon', id };
       }
       this.stallRecoveries++;
       const stage: 'in-page' | 'reload' = this.stallRecoveries === 1 ? 'in-page' : 'reload';
@@ -402,6 +405,25 @@ export class Timekeeper {
     // A new page is a fresh JS world: the ring buffer must be re-installed.
     this.ringInstalled = false;
     this.genericHeartbeatReported = false;
+  }
+
+  /** Give up on one video: mark failed, resolve its watch, advance or stop. */
+  private async abandonVideo(id: number, reason: string): Promise<TickOutcome> {
+    const { cdp, platform, log } = this.deps;
+    log('error', `timekeeper: video ${id} giving up — ${reason}. do NOT forge heartbeats.`);
+    this.gaveUp.add(id);
+    this.queue = this.queue.filter((qid) => qid !== id);
+    this.persist();
+    this.recordOutcome(id, { completed: false, failed: true });
+    const next = this.queue.find((qid) => !this.done.has(qid) && !this.gaveUp.has(qid));
+    if (next === undefined) {
+      this.stop();
+      return { kind: 'idle', detail: 'queue drained (with failures)' };
+    }
+    await cdp.navigate(videoUrl(next));
+    await platform.installHeartbeatHook(cdp);
+    this.resetPlaybackWatch(true);
+    return { kind: 'abandon', id };
   }
 
   /**
