@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>c4g options</title>
+  <style>
+    body { font: 13px/1.6 system-ui, sans-serif; margin: 24px auto; width: 460px; }
+    label { display: block; margin: 10px 0 4px; font-weight: 600; }
+    input { width: 100%; box-sizing: border-box; padding: 4px 6px; }
+    section { border: 1px solid #ddd; border-radius: 8px; padding: 4px 16px 12px; margin-bottom: 14px; }
+    h2 { font-size: 14px; margin: 12px 0 0; }
+    .hint { color: #666; font-size: 12px; margin: 4px 0 0; }
+    button { padding: 4px 12px; margin-top: 8px; }
+    #msg { color: #0a7d32; margin-left: 10px; }
+  </style>
+</head>
+<body>
+  <h1>c4g bridge options</h1>
+
+  <section>
+    <h2>Bridge</h2>
+    <label for="port">Host WebSocket port (ws://127.0.0.1:&lt;port&gt;/extension)</label>
+    <input id="port" type="number" min="1" max="65535" />
+  </section>
+
+  <section>
+    <h2>解题 LLM(OpenAI 兼容)</h2>
+    <label for="solverBaseUrl">Base URL</label>
+    <input id="solverBaseUrl" type="text" placeholder="https://open.bigmodel.cn/api/paas/v4" />
+    <label for="solverApiKey">API Key</label>
+    <input id="solverApiKey" type="password" placeholder="留空 = 沿用 host .env" />
+    <label for="solverModel">Model</label>
+    <input id="solverModel" type="text" placeholder="glm-4.5-flash" />
+    <p class="hint">密钥仅存本机(chrome.storage.local),仅发送给 127.0.0.1 的 host 进程。</p>
+  </section>
+
+  <section>
+    <h2>Jev 决策(TypeSafe System One)</h2>
+    <label for="typesafeBaseUrl">Base URL</label>
+    <input id="typesafeBaseUrl" type="text" placeholder="https://api.typesafe.ai" />
+    <label for="typesafeApiKey">API Key</label>
+    <input id="typesafeApiKey" type="password" placeholder="留空 = 沿用 host .env" />
+    <label for="typesafeModel">Model</label>
+    <input id="typesafeModel" type="text" placeholder="jev-latest" />
+  </section>
+
+  <button id="save">Save</button><span id="msg"></span>
+  <script src="options.js"></script>
+</body>
+</html>

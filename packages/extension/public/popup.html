@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>c4g bridge</title>
+  <style>
+    body { font: 12px/1.5 system-ui, sans-serif; width: 340px; margin: 0; padding: 10px; }
+    h1 { font-size: 13px; margin: 0 0 8px; }
+    .row { margin-bottom: 6px; }
+    #url { color: #555; word-break: break-all; }
+    #status.connected { color: #0a7d32; }
+    #status.disconnected { color: #b3261e; }
+    button { padding: 4px 10px; }
+    #out { white-space: pre-wrap; background: #f6f6f6; border-radius: 4px; padding: 6px; min-height: 20px; max-height: 260px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>c4g bridge</h1>
+  <div class="row">WS: <span id="status">…</span></div>
+  <div class="row" id="url">…</div>
+  <div class="row"><button id="snapshot">Snapshot</button></div>
+  <div id="out">—</div>
+  <script src="popup.js"></script>
+</body>
+</html>

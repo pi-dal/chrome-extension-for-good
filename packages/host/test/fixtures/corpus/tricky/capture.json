@@ -1,0 +1,36 @@
+{
+  "captureId": "77aa0b3d5c8e21f4",
+  "url": "https://learn.corp.example.com/exam/section?part=2",
+  "origin": "https://learn.corp.example.com",
+  "capturedAt": 1758300003000,
+  "table": {
+    "url": "https://learn.corp.example.com/exam/section?part=2",
+    "title": "综合测验（第二部分）",
+    "capturedAt": 1758300002900,
+    "elements": [
+      { "index": 1, "role": "heading", "name": "综合测验（第二部分）", "tag": "h2", "rect": { "x": 20, "y": 8, "w": 300, "h": 28 } },
+      { "index": 2, "role": "button", "name": "登录", "tag": "button", "rect": { "x": 640, "y": 12, "w": 64, "h": 28 } },
+      { "index": 3, "role": "button", "name": "收藏本题", "tag": "button", "rect": { "x": 500, "y": 60, "w": 96, "h": 30 } },
+      { "index": 4, "role": "text", "name": "1. （多选）以下哪些是编程语言？", "tag": "div", "rect": { "x": 20, "y": 110, "w": 560, "h": 24 } },
+      { "index": 5, "role": "checkbox", "name": "Python", "tag": "input", "checked": true, "rect": { "x": 30, "y": 150, "w": 18, "h": 18 } },
+      { "index": 6, "role": "checkbox", "name": "HTML", "tag": "input", "checked": true, "rect": { "x": 30, "y": 184, "w": 18, "h": 18 } },
+      { "index": 7, "role": "checkbox", "name": "Java", "tag": "input", "checked": true, "rect": { "x": 30, "y": 218, "w": 18, "h": 18 } },
+      { "index": 8, "role": "checkbox", "name": "CSS", "tag": "input", "checked": true, "rect": { "x": 30, "y": 252, "w": 18, "h": 18 } },
+      { "index": 9, "role": "text", "name": "2. 中国的首都是哪里？", "tag": "div", "rect": { "x": 20, "y": 300, "w": 560, "h": 24 } },
+      { "index": 10, "role": "radio", "name": "上海", "tag": "input", "checked": false, "rect": { "x": 30, "y": 340, "w": 18, "h": 18 } },
+      { "index": 11, "role": "radio", "name": "北京", "tag": "input", "checked": false, "rect": { "x": 30, "y": 374, "w": 18, "h": 18 } },
+      { "index": 12, "role": "radio", "name": "广州", "tag": "input", "checked": false, "rect": { "x": 30, "y": 408, "w": 18, "h": 18 } },
+      { "index": 13, "role": "text", "name": "3. 请简述 HTTP 与 HTTPS 的区别。", "tag": "div", "rect": { "x": 20, "y": 456, "w": 560, "h": 24 } },
+      { "index": 14, "role": "textbox", "name": "简答题作答区", "tag": "textarea", "value": "", "rect": { "x": 30, "y": 496, "w": 540, "h": 90 } },
+      { "index": 15, "role": "button", "name": "保存", "tag": "button", "rect": { "x": 20, "y": 610, "w": 72, "h": 32 } },
+      { "index": 16, "role": "button", "name": "交卷", "tag": "button", "rect": { "x": 100, "y": 610, "w": 72, "h": 32 } },
+      { "index": 17, "role": "text", "name": "4. （折叠区）TLS 握手使用非对称加密的目的是？", "tag": "div", "rect": { "x": 20, "y": 700, "w": 560, "h": 24 } },
+      { "index": 18, "role": "radio", "name": "在不安全信道上交换密钥", "tag": "input", "checked": false, "rect": { "x": 30, "y": 740, "w": 18, "h": 18 } },
+      { "index": 19, "role": "radio", "name": "压缩传输数据", "tag": "input", "checked": false, "rect": { "x": 30, "y": 774, "w": 18, "h": 18 } },
+      { "index": 20, "role": "button", "name": "返回顶部", "tag": "button", "rect": { "x": 620, "y": 820, "w": 88, "h": 30 } }
+    ]
+  },
+  "pageText": "综合测验（第二部分）\n1. （多选）以下哪些是编程语言？\nPython\nHTML\nJava\nCSS\n2. 中国的首都是哪里？\n上海\n北京\n广州\n3. 请简述 HTTP 与 HTTPS 的区别。\n4. （折叠区）TLS 握手使用非对称加密的目的是？\n在不安全信道上交换密钥\n压缩传输数据\nQuestion 1 of 4",
+  "progressClaim": { "raw": "Question 1 of 4", "current": 1, "total": 4 },
+  "meta": { "capturedVia": "extension", "platform": "unknown", "note": "includes nav noise, answered question, below-fold content" }
+}

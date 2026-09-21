@@ -1,0 +1,24 @@
+{
+  "name": "@c4g/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test 'test/*.test.ts' 'test/inspect/*.test.ts'",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@c4g/protocol": "workspace:*",
+    "@typesafe-ai/sdk": "^0.6.0",
+    "dotenv": "^16",
+    "ws": "^8"
+  },
+  "devDependencies": {
+    "@types/ws": "^8",
+    "linkedom": "^0.18.13",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}

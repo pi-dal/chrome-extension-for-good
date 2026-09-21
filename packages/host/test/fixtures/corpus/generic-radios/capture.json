@@ -1,0 +1,26 @@
+{
+  "captureId": "4c8b1f6e2a9d7031",
+  "url": "https://exam.example.com/quiz/123",
+  "origin": "https://exam.example.com",
+  "capturedAt": 1758200002000,
+  "table": {
+    "url": "https://exam.example.com/quiz/123",
+    "title": "环保知识小测",
+    "capturedAt": 1758200001900,
+    "elements": [
+      { "index": 1, "role": "heading", "name": "环保知识小测", "tag": "h2", "rect": { "x": 20, "y": 8, "w": 220, "h": 28 } },
+      { "index": 2, "role": "text", "name": "1. 以下哪种行为有助于减少碳排放？", "tag": "div", "rect": { "x": 20, "y": 64, "w": 560, "h": 24 } },
+      { "index": 3, "role": "radio", "name": "骑自行车出行", "tag": "input", "checked": false, "rect": { "x": 30, "y": 104, "w": 18, "h": 18 } },
+      { "index": 4, "role": "radio", "name": "自驾燃油车", "tag": "input", "checked": false, "rect": { "x": 30, "y": 138, "w": 18, "h": 18 } },
+      { "index": 5, "role": "radio", "name": "长途飞行", "tag": "input", "checked": false, "rect": { "x": 30, "y": 172, "w": 18, "h": 18 } },
+      { "index": 6, "role": "text", "name": "2. 垃圾分类中，废旧电池属于哪类垃圾？", "tag": "div", "rect": { "x": 20, "y": 220, "w": 560, "h": 24 } },
+      { "index": 7, "role": "radio", "name": "厨余垃圾", "tag": "input", "checked": false, "rect": { "x": 30, "y": 260, "w": 18, "h": 18 } },
+      { "index": 8, "role": "radio", "name": "有害垃圾", "tag": "input", "checked": false, "rect": { "x": 30, "y": 294, "w": 18, "h": 18 } },
+      { "index": 9, "role": "radio", "name": "可回收物", "tag": "input", "checked": false, "rect": { "x": 30, "y": 328, "w": 18, "h": 18 } },
+      { "index": 10, "role": "radio", "name": "其他垃圾", "tag": "input", "checked": false, "rect": { "x": 30, "y": 362, "w": 18, "h": 18 } },
+      { "index": 11, "role": "button", "name": "提交答案", "tag": "button", "rect": { "x": 20, "y": 420, "w": 96, "h": 32 } }
+    ]
+  },
+  "pageText": "环保知识小测\n1. 以下哪种行为有助于减少碳排放？\n骑自行车出行\n自驾燃油车\n长途飞行\n2. 垃圾分类中，废旧电池属于哪类垃圾？\n厨余垃圾\n有害垃圾\n可回收物\n其他垃圾",
+  "meta": { "capturedVia": "extension", "platform": "unknown" }
+}

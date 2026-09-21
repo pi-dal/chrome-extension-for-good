@@ -1,0 +1,50 @@
+{
+  "captureId": "77aa0b3d5c8e21f4",
+  "questions": [
+    {
+      "stem": "1. （多选）以下哪些是编程语言？",
+      "stemIndex": 4,
+      "optionIndices": [5, 6, 7, 8],
+      "inputIndices": [],
+      "answered": true,
+      "confidence": 1,
+      "source": "heuristic"
+    },
+    {
+      "stem": "2. 中国的首都是哪里？",
+      "stemIndex": 9,
+      "optionIndices": [10, 11, 12],
+      "inputIndices": [],
+      "answered": false,
+      "confidence": 1,
+      "source": "heuristic"
+    },
+    {
+      "stem": "3. 请简述 HTTP 与 HTTPS 的区别。",
+      "stemIndex": 13,
+      "optionIndices": [],
+      "inputIndices": [14],
+      "answered": false,
+      "confidence": 1,
+      "source": "heuristic"
+    },
+    {
+      "stem": "4. （折叠区）TLS 握手使用非对称加密的目的是？",
+      "stemIndex": 17,
+      "optionIndices": [18, 19],
+      "inputIndices": [],
+      "answered": false,
+      "confidence": 1,
+      "source": "heuristic"
+    }
+  ],
+  "navIndices": [15, 16],
+  "excluded": [
+    { "index": 1, "reason": "page heading, not a quiz candidate" },
+    { "index": 2, "reason": "login button, not quiz nav" },
+    { "index": 3, "reason": "bookmark button, not quiz nav" },
+    { "index": 20, "reason": "scroll-to-top button, not quiz nav" }
+  ],
+  "conservation": { "status": "pass", "rounds": 1, "unaccounted": [] },
+  "diagnostics": []
+}

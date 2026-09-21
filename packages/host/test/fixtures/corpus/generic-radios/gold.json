@@ -1,0 +1,27 @@
+{
+  "captureId": "4c8b1f6e2a9d7031",
+  "questions": [
+    {
+      "stem": "1. 以下哪种行为有助于减少碳排放？",
+      "stemIndex": 2,
+      "optionIndices": [3, 4, 5],
+      "inputIndices": [],
+      "answered": false,
+      "confidence": 1,
+      "source": "heuristic"
+    },
+    {
+      "stem": "2. 垃圾分类中，废旧电池属于哪类垃圾？",
+      "stemIndex": 6,
+      "optionIndices": [7, 8, 9, 10],
+      "inputIndices": [],
+      "answered": false,
+      "confidence": 1,
+      "source": "heuristic"
+    }
+  ],
+  "navIndices": [11],
+  "excluded": [{ "index": 1, "reason": "page heading, not a quiz candidate" }],
+  "conservation": { "status": "pass", "rounds": 1, "unaccounted": [] },
+  "diagnostics": []
+}
