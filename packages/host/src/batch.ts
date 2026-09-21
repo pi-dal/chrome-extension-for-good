@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { LogFn } from './log.js';
+import type { WatchOutcome } from './timekeeper.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -197,4 +199,59 @@ export function batchSummaryLine(ledger: CompletionLedger, failed: FailedLedger)
   const credited = ledger.all().length;
   const awaitingRetry = failed.all().filter(([id]) => !ledger.has(id)).length;
   return `batch summary: ${credited} video(s) credited, ${awaitingRetry} awaiting retry (completions: ${ledger.file}, failures: ${failed.file})`;
+}
+
+// ---------------------------------------------------------------------------
+// Overnight batch orchestration (chain --loop)
+// ---------------------------------------------------------------------------
+
+export interface BatchLoopDeps {
+  maxPasses: number;
+  /** One pass plan: rescrape + ledger diff. */
+  plan: () => Promise<ScrapeItem[]>;
+  /** Supervise one video to terminal state. MUST be bound to a single
+   *  Timekeeper instance for the whole run: the timekeeper's interval
+   *  auto-chains through the persisted queue, so per-item instances would
+   *  race the same tab (duplicate resume clicks, racy navigations,
+   *  misattributed failures). */
+  watch: (id: number) => Promise<WatchOutcome>;
+  ledger: CompletionLedger;
+  failed: FailedLedger;
+  log: LogFn;
+}
+
+/**
+ * Passes of plan → watch → ledger, strictly one watch at a time. The
+ * Timekeeper (owned by the caller) does the actual chaining between videos.
+ */
+export async function runBatchLoop(deps: BatchLoopDeps): Promise<void> {
+  for (let pass = 1; pass <= deps.maxPasses; pass++) {
+    const planned = await deps.plan();
+    if (planned.length === 0) {
+      deps.log('info', `batch: pass ${pass}/${deps.maxPasses} — nothing left to watch, course complete`);
+      deps.log('info', batchSummaryLine(deps.ledger, deps.failed));
+      return;
+    }
+    deps.log('info', `batch: pass ${pass}/${deps.maxPasses} — ${planned.length} video(s) to watch`);
+    for (const item of planned) {
+      if (typeof item.resourceId !== 'number') {
+        deps.log('warn', `batch: skipping item without numeric resourceId: ${item.url.slice(0, 100)}`);
+        continue;
+      }
+      // CONTRACT: watch() supervises one video to terminal state and resolves
+      // its WatchOutcome (never rejects; failed=true after maxRecovery).
+      const outcome = await deps.watch(item.resourceId);
+      if (outcome.completed) {
+        deps.ledger.record(outcome.resourceId, outcome.creditedDeltaSeconds);
+        deps.log('info', `batch: video ${outcome.resourceId} completed (credited ${outcome.creditedDeltaSeconds ?? '?'}s, ${outcome.wallSeconds.toFixed(0)}s wall, ${outcome.recoveries} recoveries)`);
+      } else if (outcome.failed) {
+        deps.failed.recordFailed(outcome.resourceId, 'recovery cap exceeded');
+        deps.log('warn', `batch: video ${outcome.resourceId} failed after ${outcome.recoveries} recoveries — will retry next pass`);
+      } else {
+        deps.log('info', `batch: video ${outcome.resourceId} stopped before terminal state — will retry next pass`);
+      }
+    }
+  }
+  deps.log('warn', `batch: reached --max-passes (${deps.maxPasses}) with videos remaining`);
+  deps.log('info', batchSummaryLine(deps.ledger, deps.failed));
 }

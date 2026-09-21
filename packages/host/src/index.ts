@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from './config.js';
-import { batchSummaryLine, CompletionLedger, defaultDataDir, FailedLedger, mergeIntoQueueFile, planNextPass, type ScrapeFn } from './batch.js';
+import { CompletionLedger, defaultDataDir, FailedLedger, mergeIntoQueueFile, planNextPass, runBatchLoop, type ScrapeFn } from './batch.js';
 import { captureFromWs, defaultCorpusDir, listCaptures, loadCapture, qualityCheck, saveCapture, wsCaptureTransport } from './capture.js';
 import { CdpTab } from './cdp.js';
 import { distillRecipe } from './distill.js';
@@ -196,42 +196,30 @@ async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: num
     failed.flush();
   };
 
-  const maxPasses = args.maxPasses ?? 3;
-  for (let pass = 1; pass <= maxPasses; pass++) {
-    const planned = await planNextPass({ courseUrl, scrape, ledger, failed });
-    if (planned.length === 0) {
-      log('info', `batch: pass ${pass}/${maxPasses} — nothing left to watch, course complete`);
-      log('info', batchSummaryLine(ledger, failed));
-      return;
-    }
-    log('info', `batch: pass ${pass}/${maxPasses} — ${planned.length} video(s) to watch`);
-    mergeIntoQueueFile(
-      queueFile,
-      planned.map((item) => Number(item.resourceId)).filter(Number.isFinite),
-    );
-
-    for (const item of planned) {
-      if (typeof item.resourceId !== 'number') {
-        log('warn', `batch: skipping item without numeric resourceId: ${item.url.slice(0, 100)}`);
-        continue;
+  // F1 (review): ONE supervisor for the whole run. The timekeeper's interval
+  // auto-chains through the persisted queue, so per-item instances would race
+  // the same tab (duplicate resume clicks, racy navigations, misattributed
+  // failures). Sequential watch() on a single instance short-circuits via the
+  // in-memory done set instead.
+  const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform: moodleVideo, log });
+  await runBatchLoop({
+    maxPasses: args.maxPasses ?? 3,
+    plan: async () => {
+      const planned = await planNextPass({ courseUrl, scrape, ledger, failed });
+      if (planned.length > 0) {
+        mergeIntoQueueFile(
+          queueFile,
+          planned.map((item) => Number(item.resourceId)).filter(Number.isFinite),
+        );
       }
-      const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform: moodleVideo, log });
-      // CONTRACT: watch() supervises one video to terminal state and resolves
-      // its WatchOutcome (never rejects; failed=true after maxRecovery).
-      const outcome = await timekeeper.watch(item.resourceId);
-      if (outcome.completed) {
-        ledger.record(outcome.resourceId, outcome.creditedDeltaSeconds);
-        log('info', `batch: video ${outcome.resourceId} completed (credited ${outcome.creditedDeltaSeconds ?? '?'}s, ${outcome.wallSeconds.toFixed(0)}s wall, ${outcome.recoveries} recoveries)`);
-      } else if (outcome.failed) {
-        failed.recordFailed(outcome.resourceId, 'recovery cap exceeded');
-        log('warn', `batch: video ${outcome.resourceId} failed after ${outcome.recoveries} recoveries — will retry next pass`);
-      } else {
-        log('info', `batch: video ${outcome.resourceId} stopped before terminal state — will retry next pass`);
-      }
-    }
-  }
-  log('warn', `batch: reached --max-passes (${maxPasses}) with videos remaining`);
-  log('info', batchSummaryLine(ledger, failed));
+      return planned;
+    },
+    watch: (id) => timekeeper.watch(id),
+    ledger,
+    failed,
+    log,
+  });
+  timekeeper.stop();
 }
 
 async function main(): Promise<void> {

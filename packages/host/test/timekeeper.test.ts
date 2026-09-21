@@ -253,3 +253,27 @@ describe('Timekeeper', () => {
     assert.ok(!/XMLHttpRequest|\.ajax\(|fetch\(/.test(solverish), 'quiz loop must not issue raw HTTP');
   });
 });
+
+describe('Timekeeper watch() re-arm', () => {
+  it('re-arms a previously abandoned id so planner retries do not hang', async () => {
+    const h = makeHarness({ playing: true, totaltime: 100, currentTime: 100, duration: 6000 });
+    h.deps.maxRecovery = 0; // first stall evaluation gives up immediately
+    const tk = new Timekeeper(h.deps);
+    const p1 = tk.watch(101);
+    for (let i = 0; i < 10; i++) {
+      const o = await tk.tick();
+      if (o.kind === 'idle') break; // give-up drained the queue
+    }
+    const first = await p1;
+    assert.equal(first.failed, true);
+
+    // Planner retry (failed.json cap not exhausted): watch(101) again must
+    // re-arm the id instead of leaving the promise pending forever.
+    h.setPlayer({ totaltime: 5999, currentTime: 5999, progress: 100 });
+    const p2 = tk.watch(101);
+    await tk.tick(); // video now finished → done.add + recordOutcome(completed)
+    const second = await p2;
+    assert.equal(second.completed, true);
+    assert.equal(second.failed, false);
+  });
+});

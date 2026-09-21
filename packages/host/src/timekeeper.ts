@@ -214,6 +214,11 @@ export class Timekeeper {
    * failed=true after maxRecovery exhausted recovery attempts.
    */
   async watch(id: number): Promise<WatchOutcome> {
+    // A planner retry may re-queue a previously abandoned id (failed.json cap
+    // not yet exhausted). Re-arm it — abandon is per-attempt state; without
+    // this, start()'s gaveUp queue filter would silently drop the id and this
+    // promise would never resolve.
+    this.gaveUp.delete(id);
     if (this.done.has(id)) {
       const outcome: WatchOutcome = {
         resourceId: id,

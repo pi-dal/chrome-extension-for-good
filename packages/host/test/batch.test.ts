@@ -10,6 +10,7 @@ import {
   mergeIntoQueueFile,
   planNextPass,
   rescanCourse,
+  runBatchLoop,
   type LedgerIO,
   type ScrapeItem,
 } from '../src/batch.js';
@@ -217,5 +218,69 @@ describe('batchSummaryLine', () => {
     const line = batchSummaryLine(ledger, failed);
     assert.match(line, /1 video\(s\) credited/);
     assert.match(line, /1 awaiting retry/);
+  });
+});
+
+describe('runBatchLoop', () => {
+  function outcome(id: number, over: Partial<{ completed: boolean; failed: boolean; wallSeconds: number; creditedDeltaSeconds: number | null; recoveries: number }> = {}) {
+    return { resourceId: id, completed: true, failed: false, wallSeconds: 30, creditedDeltaSeconds: 300, recoveries: 0, ...over };
+  }
+
+  it('watches each planned item once, records completions/failures, returns on course complete', async () => {
+    const io = makeIo();
+    const ledger = new CompletionLedger(join(tmp, 'loop-comp.json'), io);
+    const failed = new FailedLedger(join(tmp, 'loop-fail.json'), io);
+    ledger.load();
+    failed.load();
+    const plans: ScrapeItem[][] = [
+      [
+        { url: '/mod/fsresource/view.php?id=1', resourceId: 1 },
+        { url: '/mod/fsresource/view.php?id=2', resourceId: 2 },
+      ],
+      [{ url: '/mod/fsresource/view.php?id=3', resourceId: 3 }],
+      [],
+    ];
+    const watched: number[] = [];
+    const logs: string[] = [];
+    await runBatchLoop({
+      maxPasses: 3,
+      plan: async () => plans.shift() ?? [],
+      watch: async (id) => {
+        watched.push(id);
+        return outcome(id, id === 2 ? { completed: false, failed: true, creditedDeltaSeconds: null, recoveries: 3 } : {});
+      },
+      ledger,
+      failed,
+      log: (level, msg) => logs.push(`${level}:${msg}`),
+    });
+    assert.deepEqual(watched, [1, 2, 3]);
+    assert.equal(ledger.has(1), true);
+    assert.equal(ledger.has(3), true);
+    assert.equal(ledger.has(2), false); // failed -> never in completions
+    assert.equal(failed.exhausted(2), false); // 1 attempt < cap 3
+    assert.ok(logs.some((l) => l.includes('course complete')));
+  });
+
+  it('terminates at maxPasses with videos remaining (no infinite loop)', async () => {
+    const io = makeIo();
+    const ledger = new CompletionLedger(join(tmp, 'loop-comp2.json'), io);
+    const failed = new FailedLedger(join(tmp, 'loop-fail2.json'), io);
+    ledger.load();
+    failed.load();
+    let watchCount = 0;
+    const logs: string[] = [];
+    await runBatchLoop({
+      maxPasses: 2,
+      plan: async () => [{ url: '/mod/fsresource/view.php?id=9', resourceId: 9 }],
+      watch: async (id) => {
+        watchCount += 1;
+        return outcome(id, { completed: false, failed: true });
+      },
+      ledger,
+      failed,
+      log: (_level, msg) => logs.push(msg),
+    });
+    assert.equal(watchCount, 2);
+    assert.ok(logs.some((l) => l.includes('--max-passes (2)')));
   });
 });
