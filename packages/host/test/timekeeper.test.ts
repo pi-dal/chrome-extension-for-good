@@ -137,14 +137,63 @@ describe('Timekeeper', () => {
     tk.stop();
   });
 
-  it('warns once when server totaltime stalls for 4 ticks while playing', async () => {
+  it('stall recovery: in-page attempt, then reloads, then abandons the video as failed', async () => {
     const h = makeHarness({ playing: true, totaltime: 100, currentTime: 100, duration: 6000 });
     const tk = new Timekeeper(h.deps);
+    tk.setQueue([101]);
+    const outcomePromise = tk.watch(101);
+    await new Promise((r) => setImmediate(r)); // let watch()'s immediate tick run (stall tick 1)
     const outcomes: TickOutcome[] = [];
-    for (let i = 0; i < 6; i++) outcomes.push(await tk.tick());
-    // ticks 2..5 keep totaltime identical → the 4th identical tick warns
-    assert.equal(outcomes.filter((o) => o.kind === 'stall-warned').length, 1);
-    assert.ok(h.logs.some((l) => l.startsWith('warn:timekeeper: server totaltime')));
+    const navCountBefore = h.navigations.length;
+    for (let i = 0; i < 24; i++) {
+      const o = await tk.tick();
+      outcomes.push(o);
+      if (o.kind === 'idle') break; // abandoned video drained the queue
+    }
+    const outcome = await outcomePromise; // must resolve, never reject
+    const recovers = outcomes.filter((o) => o.kind === 'recover') as Array<Extract<TickOutcome, { kind: 'recover' }>>;
+    assert.deepEqual(
+      recovers.map((r) => [r.attempt, r.stage]),
+      [
+        [1, 'in-page'],
+        [2, 'reload'],
+        [3, 'reload'],
+      ],
+    );
+    // queue had only this video → the give-up tick drains it and reports idle
+    assert.equal(outcomes[outcomes.length - 1].kind, 'idle');
+    // in-page attempt used the trusted click path; reloads navigated the same URL twice
+    assert.equal(h.actions.filter((a) => a.op === 'click').length >= 1, true);
+    assert.equal(h.navigations.length - navCountBefore, 2);
+    assert.equal(outcome.failed, true);
+    assert.equal(outcome.completed, false);
+    assert.equal(outcome.recoveries, 3);
+    assert.equal(outcome.creditedDeltaSeconds, 0); // stuck at 100 → server credited nothing new
+    const summary = tk.runSummary();
+    assert.equal(summary.length, 1);
+    assert.equal(summary[0].resourceId, 101);
+    assert.equal(summary[0].failed, true);
+    assert.ok(h.logs.some((l) => l.includes('101 failed credited=0/recovered=3')));
+    // the failed video must NOT be marked done (it is not finished)
+    const persisted = JSON.parse(readFileSync(h.deps.dataFile, 'utf8')) as { done: number[] };
+    assert.deepEqual(persisted.done, []);
+    tk.stop();
+  });
+
+  it('watch() resolves a completed WatchOutcome with credited accounting', async () => {
+    const h = makeHarness({ playing: true, totaltime: 10, currentTime: 10, duration: 300 });
+    const tk = new Timekeeper(h.deps);
+    const outcomePromise = tk.watch(101);
+    await new Promise((r) => setImmediate(r));
+    h.setPlayer({ currentTime: 299, totaltime: 299, progress: 99 });
+    await tk.tick(); // finished
+    const outcome = await outcomePromise;
+    assert.equal(outcome.completed, true);
+    assert.equal(outcome.failed, false);
+    assert.equal(outcome.resourceId, 101);
+    assert.equal(outcome.creditedDeltaSeconds, 289); // 299 - 10, from read-back only
+    assert.equal(outcome.recoveries, 0);
+    assert.ok(h.logs.some((l) => l.includes('101 completed credited=289/recovered=0')));
     tk.stop();
   });
 
