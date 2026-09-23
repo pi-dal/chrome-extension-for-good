@@ -2,10 +2,9 @@
  * Generic heartbeat detection (design §4.4): install a request ring buffer in
  * the page (MAIN world via CDP), then frequency-cluster the samples.
  *
- * SAFETY INVARIANT: this module is strictly observational. The patches wrap
- * the page's own XHR/fetch and always call through — the host never synthesizes,
- * replays, or modifies any request. Server-credited time can only advance via
- * genuine playback (read-only; see platforms/moodle-video.ts).
+ * The patches wrap the page's own XHR/fetch and always call through: the host
+ * reads traffic, it does not issue it. Server-credited time therefore only
+ * advances through the page's own genuine playback.
  */
 
 export interface XhrSample {

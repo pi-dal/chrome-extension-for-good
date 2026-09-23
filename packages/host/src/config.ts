@@ -15,9 +15,7 @@ export interface Config {
   solverBaseUrl: string;
   solverApiKey: string;
   solverModel: string;
-  /**
-   * SAFETY: when false (default) the quiz loop never clicks submit/交卷 controls.
-   */
+  /** When false (default) the quiz loop stops before submit/交卷 controls. */
   autoSubmit: boolean;
 }
 

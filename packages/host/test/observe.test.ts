@@ -153,7 +153,7 @@ describe('detectHeartbeat (frequency clustering)', () => {
   });
 });
 
-describe('safety invariants (source-level guards)', () => {
+describe('observation-only invariants (source-level guards)', () => {
   it('ring script only observes — it always calls the original XHR/fetch', () => {
     assert.ok(RING_SCRIPT.includes('openOrig.apply(this, arguments)'));
     assert.ok(RING_SCRIPT.includes('sendOrig.apply(this, arguments)'));

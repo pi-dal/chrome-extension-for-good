@@ -81,7 +81,7 @@ function isAnswered(table: ElementTable, q: QuizQuestionModel): boolean {
  * - read-back verification: after answering, a fresh quizOnly snapshot must
  *   confirm the new state before the question counts as answered
  *
- * SAFETY: with autoSubmit=false this loop NEVER clicks anything matching
+ * With autoSubmit=false this loop stops before clicking anything matching
  * SUBMIT_NAV_RE — it logs and stops instead. Saving answers (保存/check) is fine.
  */
 export async function runQuizLoop(deps: QuizLoopDeps, tabId: number): Promise<QuizLoopReport> {
