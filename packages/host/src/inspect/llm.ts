@@ -166,8 +166,22 @@ export function validateEnumeration(parsed: unknown, table: ElementTable): Enume
   };
 }
 
-export function buildUserPrompt(table: ElementTable, pageText: string | undefined, missing: number[]): string {
+/**
+ * `hints` carries platform structure the operator (or a site plugin) already
+ * knows — e.g. "this platform puts one question per .u-questionItem". It is
+ * advisory context for the enumerator; grounding and conservation still decide
+ * whether the enumeration is accepted.
+ */
+export function buildUserPrompt(
+  table: ElementTable,
+  pageText: string | undefined,
+  missing: number[],
+  hints?: string,
+): string {
   const parts: string[] = [renderTable(table)];
+  if (hints) {
+    parts.push(`\nplatform hints (advisory context from the site plugin):\n${hints.slice(0, 800)}`);
+  }
   if (pageText) {
     parts.push(`\npage text (fallback, may be truncated):\n${pageText.slice(0, PAGE_TEXT_BUDGET)}`);
   }
@@ -210,9 +224,14 @@ export class LlmEnumerator {
    * parseable reply arrives. Validation/grounding never throws: bad replies
    * surface as notes + invalidIndices on the returned attempt.
    */
-  async enumerate(table: ElementTable, pageText?: string, missing: number[] = []): Promise<EnumerationAttempt | null> {
+  async enumerate(
+    table: ElementTable,
+    pageText?: string,
+    missing: number[] = [],
+    hints?: string,
+  ): Promise<EnumerationAttempt | null> {
     if (!this.enabled) return null;
-    const user = buildUserPrompt(table, pageText, missing);
+    const user = buildUserPrompt(table, pageText, missing, hints);
     let raw: string | undefined;
     try {
       raw = await this.complete(SYSTEM_PROMPT, user);

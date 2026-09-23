@@ -24,6 +24,8 @@ export interface InspectDeps {
   log: LogFn;
   /** Optional L1 accelerator (design §4.3): live recipe confirmation. */
   l1?: L1Deps;
+  /** Advisory platform structure for the LLM layer (from the site plugin). */
+  hints?: string;
 }
 
 /** Live deps from env (SOLVER_* for the enumerator, TYPESAFE_API_KEY for arbitration). */
@@ -244,7 +246,7 @@ export async function inspectPage(capture: PageCapture, deps: InspectDeps): Prom
   if (!deps.llm.enabled) {
     diagnostics.push('llm unavailable (dry-run): heuristic-only inspection');
   } else {
-    const attempt = await deps.llm.enumerate(table, capture.pageText);
+    const attempt = await deps.llm.enumerate(table, capture.pageText, [], deps.hints);
     if (!attempt) {
       diagnostics.push('llm enumeration unavailable (no parseable reply)');
     } else {
@@ -254,7 +256,7 @@ export async function inspectPage(capture: PageCapture, deps: InspectDeps): Prom
       if (unaccounted.length > 0 && rounds < MAX_ENUMERATION_ATTEMPTS) {
         rounds = 2;
         diagnostics.push(`conservation feedback: unaccounted [${unaccounted.join(', ')}] fed back to llm`);
-        const retry = await deps.llm.enumerate(table, capture.pageText, unaccounted);
+        const retry = await deps.llm.enumerate(table, capture.pageText, unaccounted, deps.hints);
         if (retry) {
           diagnostics.push(...retry.notes.map((n) => `llm(r2): ${n}`));
           const merged2 = await applyEnumeration(merged, retry.enumeration, table, deps, diagnostics);
