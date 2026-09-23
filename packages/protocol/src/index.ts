@@ -48,6 +48,131 @@ export interface TabInfo {
   title: string;
 }
 
+// ---------------------------------------------------------------------------
+// Site plugins (platform adapters as data)
+// ---------------------------------------------------------------------------
+
+/**
+ * A platform adapter, expressed as data instead of code.
+ *
+ * The JS fields run in the page's MAIN world through CDP `evaluate`, exactly
+ * like the built-in adapter used to: `heartbeatHookJs` installs an idempotent
+ * recorder for the platform's own heartbeat traffic, `playerStateJs` reads the
+ * player, `courseIdsJs` lists the videos on a course page. They are trusted
+ * configuration — written by the operator in the extension options page or in
+ * data/plugins/*.json — so validation guarantees shape, size and compilable
+ * patterns, never sandboxing.
+ */
+export interface SitePluginMatch {
+  /** Substring of a TAB url that this plugin owns (e.g. '/mod/fsresource/view.php'). */
+  video: string;
+  /** Additional video-page substrings (platforms with several player URLs). */
+  videoAny?: string[];
+  /** Optional substring identifying the course/list page (enables `chain` scraping). */
+  course?: string;
+  /** Additional course-page substrings. */
+  courseAny?: string[];
+}
+
+export interface SitePlugin {
+  id: string;
+  label?: string;
+  match: SitePluginMatch;
+  /** Known heartbeat URL fragment (enables the fast path in observation). */
+  heartbeatUrlPattern?: string;
+  /** MAIN-world source: record the platform's last heartbeat request/response. */
+  heartbeatHookJs: string;
+  /** MAIN-world expression: player state object (or its JSON string). */
+  playerStateJs: string;
+  /** MAIN-world expression: JSON array of video ids on a course page. */
+  courseIdsJs?: string;
+  /** Video page URL template containing `{id}`. */
+  videoUrlTemplate?: string;
+  /** Regex with one capture group extracting the video id from a video URL. */
+  idPattern?: string;
+  /**
+   * Where this definition came from (repo/URL/path, free text). Required in
+   * spirit for anything not measured on the deployment: the host logs it and
+   * the options page shows it, so nobody mistakes a derived adapter for a
+   * battle-tested one.
+   */
+  source?: string;
+  /** What is missing or must be re-checked (fields to look for, caveats). */
+  notes?: string;
+  /** True only when this definition was measured against a live account. */
+  verified?: boolean;
+  /**
+   * Report-replay knowledge (instant-pass / accelerated reporting). The MECHANISM lives in the host
+   * (forge.ts): replay the plugin's own recorded heartbeat request with the
+   * position field rewritten. A plugin only contributes the platform knowledge —
+   * which numeric field carries the position — plus a note. A plugin that cannot
+   * expose a readable server ack (totaltime/progress) cannot be verified, and
+   * forging stays off for it.
+   */
+  forge?: SitePluginForge;
+  /**
+   * Quiz-page knowledge for the automatic inspect pipeline (M2).
+   *
+   * inspect's own layers stay in charge — a plugin only contributes what the
+   * platform knows up front: where the quiz lives on the page, what the nav
+   * buttons are called, and which selectors describe a question. Everything is
+   * still verified against the live page and audited by the conservation rule;
+   * learned recipes (data/recipes/<origin>.json) take precedence over this.
+   */
+  quiz?: SitePluginQuiz;
+}
+
+export interface SitePluginQuiz {
+  /** Narrow candidate scanning to this subtree (containers, chrome, forums). */
+  rootSelector?: string;
+  /** Selector describing one question container (confirms/anchors grouping). */
+  questionSelector?: string;
+  /** Selector describing one option row. */
+  optionSelector?: string;
+  /** Selector for the platform's own progress/time widget (progressClaim). */
+  progressSelector?: string;
+  /** Exact nav button labels (e.g. check/save/next/submit in the page's language). */
+  navLabels?: string[];
+  source?: string;
+  notes?: string;
+  /** True only when these selectors were confirmed on a live quiz page. */
+  verified?: boolean;
+}
+
+export interface SitePluginForge {
+  /**
+   * G ENERAL path: regex matching the position field inside the recorded
+   * heartbeat body, e.g. `"(?:time|totaltime|playingTime)"\\s*:\\s*"?\\d+`. The
+   * host rewrites that number and re-sends the recorded request.
+   */
+  timeFieldPattern?: string;
+  /**
+   * PLATFORM path for reports that cannot be edited generically (signed or
+   * obfuscated payloads). MAIN-world source that reads
+   * `window.__c4gForgePosition` and resolves with `{ok, status, detail}`; it may
+   * use whatever its own hook captured. Takes precedence over timeFieldPattern.
+   */
+  replayJs?: string;
+  /** What is known/unknown about replaying this platform's report. */
+  note?: string;
+}
+
+export interface PluginLimits {
+  maxPlugins: number;
+  maxJsBytes: number;
+  maxTextBytes: number;
+  maxTotalBytes: number;
+  maxAltPatterns: number;
+}
+
+export const PLUGIN_LIMITS: PluginLimits = {
+  maxPlugins: 16,
+  maxJsBytes: 16_384,
+  maxTextBytes: 512,
+  maxTotalBytes: 262_144,
+  maxAltPatterns: 8,
+};
+
 export type HostToExt =
   | {
       type: 'snapshot_request';
@@ -56,7 +181,11 @@ export type HostToExt =
       quizOnly?: boolean;
       includePageText?: boolean;
     }
-  | { type: 'action_request'; requestId: string; tabId: number; action: Action };
+  | { type: 'action_request'; requestId: string; tabId: number; action: Action }
+  /** Swarm lane provisioning: open a tab and report its chrome.tabs id. */
+  | { type: 'open_tab'; requestId: string; url: string; active?: boolean }
+  /** Swarm lane teardown: close a tab this run created. */
+  | { type: 'close_tab'; requestId: string; tabId: number };
 
 export interface HostConfigPatch {
   solverBaseUrl?: string;
@@ -71,6 +200,8 @@ export type ExtToHost =
   | { type: 'hello'; extVersion: string; tabs: TabInfo[] }
   | { type: 'snapshot'; requestId: string; table: ElementTable; pageText?: string }
   | { type: 'action_result'; requestId: string; ok: boolean; error?: string; url: string; value?: unknown }
+  /** Reply to open_tab/close_tab: the affected chrome.tabs id. */
+  | { type: 'tab_result'; requestId: string; ok: boolean; tabId: number; url: string; error?: string }
   | {
       type: 'event';
       kind: 'nav' | 'lms_heartbeat';
@@ -79,6 +210,8 @@ export type ExtToHost =
       ts: number;
     }
   | { type: 'config_sync'; config: HostConfigPatch }
+  /** Site plugins pushed by the extension options page (full-state sync). */
+  | { type: 'plugins_sync'; plugins: SitePlugin[] }
   | { type: 'log'; level: 'debug' | 'info' | 'warn' | 'error'; msg: string; data?: unknown };
 
 // ---------------------------------------------------------------------------
@@ -246,6 +379,23 @@ export function parseExtToHost(raw: unknown): ExtToHost {
         ...(value !== undefined ? { value } : {}),
       };
     }
+    case 'tab_result': {
+      if (!isStr(raw.requestId)) throw new Error('invalid tab_result.requestId');
+      if (typeof raw.ok !== 'boolean') throw new Error('invalid tab_result.ok');
+      if (!isNum(raw.tabId)) throw new Error('invalid tab_result.tabId');
+      if (!isStr(raw.url)) throw new Error('invalid tab_result.url');
+      if (raw.error !== undefined && !isStr(raw.error)) {
+        throw new Error('invalid tab_result.error');
+      }
+      return {
+        type: 'tab_result',
+        requestId: raw.requestId,
+        ok: raw.ok,
+        tabId: raw.tabId,
+        url: raw.url,
+        ...(raw.error !== undefined ? { error: raw.error } : {}),
+      };
+    }
     case 'event': {
       if (
         !isStr(raw.kind) ||
@@ -287,6 +437,10 @@ export function parseExtToHost(raw: unknown): ExtToHost {
         cfg[k] = v;
       }
       return { type: 'config_sync', config: cfg };
+    }
+    case 'plugins_sync': {
+      // Full-state sync of the site-plugin list from the extension options page.
+      return { type: 'plugins_sync', plugins: parseSitePlugins(raw.plugins) };
     }
     case 'log': {
       if (
@@ -338,9 +492,170 @@ export function parseHostToExt(raw: unknown): HostToExt {
         action: parseAction(raw.action),
       };
     }
+    case 'open_tab': {
+      if (!isStr(raw.requestId)) throw new Error('invalid open_tab.requestId');
+      if (!isNonEmptyStr(raw.url)) throw new Error('invalid open_tab.url');
+      if (raw.active !== undefined && typeof raw.active !== 'boolean') {
+        throw new Error('invalid open_tab.active');
+      }
+      return {
+        type: 'open_tab',
+        requestId: raw.requestId,
+        url: raw.url,
+        ...(raw.active !== undefined ? { active: raw.active } : {}),
+      };
+    }
+    case 'close_tab': {
+      if (!isStr(raw.requestId)) throw new Error('invalid close_tab.requestId');
+      if (!isNum(raw.tabId)) throw new Error('invalid close_tab.tabId');
+      return { type: 'close_tab', requestId: raw.requestId, tabId: raw.tabId };
+    }
     default:
       throw new Error(`invalid HostToExt.type: ${JSON.stringify(raw.type)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Site plugin validators
+// ---------------------------------------------------------------------------
+
+/** UTF-8 byte length without Buffer — this module also runs in the browser. */
+function utf8Bytes(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
+function boundedText(raw: unknown, label: string, maxBytes: number): string {
+  if (!isStr(raw)) throw new Error(`invalid ${label}: expected string`);
+  if (raw.length === 0) throw new Error(`invalid ${label}: empty`);
+  if (utf8Bytes(raw) > maxBytes) {
+    throw new Error(`invalid ${label}: exceeds ${maxBytes} bytes`);
+  }
+  return raw;
+}
+
+export function parseSitePlugin(raw: unknown): SitePlugin {
+  if (!isRecord(raw)) throw new Error('invalid SitePlugin: not an object');
+  const id = boundedText(raw.id, 'SitePlugin.id', 64);
+  if (!/^[A-Za-z0-9._-]+$/.test(id)) throw new Error(`invalid SitePlugin.id: ${JSON.stringify(id)}`);
+  if (!isRecord(raw.match)) throw new Error('invalid SitePlugin.match: not an object');
+  const match: SitePluginMatch = {
+    video: boundedText(raw.match.video, 'SitePlugin.match.video', 256),
+  };
+  for (const key of ['videoAny', 'courseAny'] as const) {
+    const value = raw.match[key];
+    if (value === undefined) continue;
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(`invalid SitePlugin.match.${key}: expected a non-empty array`);
+    }
+    if (value.length > PLUGIN_LIMITS.maxAltPatterns) {
+      throw new Error(`invalid SitePlugin.match.${key}: more than ${PLUGIN_LIMITS.maxAltPatterns} entries`);
+    }
+    match[key] = value.map((v) => boundedText(v, `SitePlugin.match.${key}[]`, 256));
+  }
+  if (raw.match.course !== undefined) {
+    match.course = boundedText(raw.match.course, 'SitePlugin.match.course', 256);
+  }
+  const plugin: SitePlugin = {
+    id,
+    match,
+    heartbeatHookJs: boundedText(raw.heartbeatHookJs, 'SitePlugin.heartbeatHookJs', PLUGIN_LIMITS.maxJsBytes),
+    playerStateJs: boundedText(raw.playerStateJs, 'SitePlugin.playerStateJs', PLUGIN_LIMITS.maxJsBytes),
+  };
+  if (raw.label !== undefined) plugin.label = boundedText(raw.label, 'SitePlugin.label', 128);
+  if (raw.source !== undefined) plugin.source = boundedText(raw.source, 'SitePlugin.source', PLUGIN_LIMITS.maxTextBytes);
+  if (raw.notes !== undefined) plugin.notes = boundedText(raw.notes, 'SitePlugin.notes', PLUGIN_LIMITS.maxTextBytes);
+  if (raw.verified !== undefined) {
+    if (typeof raw.verified !== 'boolean') throw new Error('invalid SitePlugin.verified: expected boolean');
+    plugin.verified = raw.verified;
+  }
+  if (raw.quiz !== undefined) {
+    if (!isRecord(raw.quiz)) throw new Error('invalid SitePlugin.quiz: not an object');
+    const quiz: SitePluginQuiz = {};
+    const selectors = ['rootSelector', 'questionSelector', 'optionSelector', 'progressSelector'] as const;
+    for (const key of selectors) {
+      if (raw.quiz[key] !== undefined) quiz[key] = boundedText(raw.quiz[key], `SitePlugin.quiz.${key}`, 256);
+    }
+    if (raw.quiz.navLabels !== undefined) {
+      if (!Array.isArray(raw.quiz.navLabels) || raw.quiz.navLabels.length === 0) {
+        throw new Error('invalid SitePlugin.quiz.navLabels: expected a non-empty array');
+      }
+      if (raw.quiz.navLabels.length > PLUGIN_LIMITS.maxAltPatterns) {
+        throw new Error(`invalid SitePlugin.quiz.navLabels: more than ${PLUGIN_LIMITS.maxAltPatterns} labels`);
+      }
+      quiz.navLabels = raw.quiz.navLabels.map((l) => boundedText(l, 'SitePlugin.quiz.navLabels[]', 64));
+    }
+    if (raw.quiz.source !== undefined) quiz.source = boundedText(raw.quiz.source, 'SitePlugin.quiz.source', PLUGIN_LIMITS.maxTextBytes);
+    if (raw.quiz.notes !== undefined) quiz.notes = boundedText(raw.quiz.notes, 'SitePlugin.quiz.notes', PLUGIN_LIMITS.maxTextBytes);
+    if (raw.quiz.verified !== undefined) {
+      if (typeof raw.quiz.verified !== 'boolean') throw new Error('invalid SitePlugin.quiz.verified: expected boolean');
+      quiz.verified = raw.quiz.verified;
+    }
+    if (Object.keys(quiz).length === 0) throw new Error('invalid SitePlugin.quiz: empty object');
+    plugin.quiz = quiz;
+  }
+  if (raw.forge !== undefined) {
+    if (!isRecord(raw.forge)) throw new Error('invalid SitePlugin.forge: not an object');
+    const forge: SitePluginForge = {};
+    if (raw.forge.timeFieldPattern !== undefined) {
+      const pattern = boundedText(raw.forge.timeFieldPattern, 'SitePlugin.forge.timeFieldPattern', 256);
+      try {
+        new RegExp(pattern);
+      } catch (err) {
+        throw new Error(`invalid SitePlugin.forge.timeFieldPattern: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      forge.timeFieldPattern = pattern;
+    }
+    if (raw.forge.replayJs !== undefined) {
+      forge.replayJs = boundedText(raw.forge.replayJs, 'SitePlugin.forge.replayJs', PLUGIN_LIMITS.maxJsBytes);
+    }
+    if (raw.forge.note !== undefined) forge.note = boundedText(raw.forge.note, 'SitePlugin.forge.note', PLUGIN_LIMITS.maxTextBytes);
+    if (forge.timeFieldPattern === undefined && forge.replayJs === undefined && forge.note === undefined) {
+      throw new Error('invalid SitePlugin.forge: needs timeFieldPattern, replayJs or note');
+    }
+    plugin.forge = forge;
+  }
+  if (raw.heartbeatUrlPattern !== undefined) {
+    plugin.heartbeatUrlPattern = boundedText(raw.heartbeatUrlPattern, 'SitePlugin.heartbeatUrlPattern', 256);
+  }
+  if (raw.courseIdsJs !== undefined) {
+    plugin.courseIdsJs = boundedText(raw.courseIdsJs, 'SitePlugin.courseIdsJs', PLUGIN_LIMITS.maxJsBytes);
+  }
+  if (raw.videoUrlTemplate !== undefined) {
+    const tpl = boundedText(raw.videoUrlTemplate, 'SitePlugin.videoUrlTemplate', PLUGIN_LIMITS.maxTextBytes);
+    if (!tpl.includes('{id}')) throw new Error('invalid SitePlugin.videoUrlTemplate: missing {id} placeholder');
+    plugin.videoUrlTemplate = tpl;
+  }
+  if (raw.idPattern !== undefined) {
+    const pattern = boundedText(raw.idPattern, 'SitePlugin.idPattern', 256);
+    let re: RegExp;
+    try {
+      re = new RegExp(pattern);
+    } catch (err) {
+      throw new Error(`invalid SitePlugin.idPattern: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (!/\((?!\?)/.test(pattern)) {
+      throw new Error('invalid SitePlugin.idPattern: needs a capture group, e.g. "view\\\\.php\\\\?id=(\\\\d+)"');
+    }
+    plugin.idPattern = pattern;
+  }
+  return plugin;
+}
+
+export function parseSitePlugins(raw: unknown): SitePlugin[] {
+  if (!Array.isArray(raw)) throw new Error('invalid plugins payload: not an array');
+  if (raw.length > PLUGIN_LIMITS.maxPlugins) {
+    throw new Error(`invalid plugins payload: more than ${PLUGIN_LIMITS.maxPlugins} plugins`);
+  }
+  const plugins = raw.map((p) => parseSitePlugin(p));
+  const ids = new Set<string>();
+  for (const p of plugins) {
+    if (ids.has(p.id)) throw new Error(`invalid plugins payload: duplicate id ${p.id}`);
+    ids.add(p.id);
+  }
+  if (JSON.stringify(plugins).length > PLUGIN_LIMITS.maxTotalBytes) {
+    throw new Error(`invalid plugins payload: exceeds ${PLUGIN_LIMITS.maxTotalBytes} bytes`);
+  }
+  return plugins;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +722,7 @@ export interface QuizQuestionModel {
 export interface InspectionResult {
   captureId: string;
   questions: QuizQuestionModel[];
-  /** 检查/保存/下一页/交卷 etc. — submission is still gated by AUTO_SUBMIT. */
+  /** check/save/next/submit controls — submission is still gated by AUTO_SUBMIT. */
   navIndices: number[];
   /** Quiz-candidate elements deliberately NOT part of the quiz, with reasons. */
   excluded: Array<{ index: number; reason: string }>;
@@ -600,3 +915,18 @@ export function parseInspectionSession(raw: unknown): InspectionSession {
     diagnostics: [...raw.diagnostics],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Built-in site plugins (data)
+// ---------------------------------------------------------------------------
+
+export {
+  BUILTIN_PLUGINS,
+  CHAOXING_FORGE_JS,
+  CHAOXING_MD5_JS,
+  CHAOXING_PLUGIN,
+  ICOURSE163_PLUGIN,
+  LMS_FSRESOURCE_PLUGIN,
+  ZHIHUISHU_FORGE_JS,
+  ZHIHUISHU_PLUGIN,
+} from './plugins/index.js';

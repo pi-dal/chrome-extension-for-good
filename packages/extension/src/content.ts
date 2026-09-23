@@ -470,9 +470,11 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse: (resp
         // No error envelope exists for snapshots; the host request times out.
         console.warn('[c4g-cs] snapshot failed:', err);
       }
-    } else {
+    } else if (msg.type === 'action_request') {
       sendResponse(await executeAction(msg.requestId, msg.action));
     }
+    // open_tab/close_tab never reach a content script (the service worker
+    // answers those itself), so any other variant is ignored here.
   })();
   return true; // keep the message channel open for the async response
 });

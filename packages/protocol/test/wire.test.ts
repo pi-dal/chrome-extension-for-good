@@ -142,6 +142,34 @@ test('HostToExt: both variants round-trip', () => {
   assert.deepEqual(roundTrip(parseHostToExt, bare), bare);
 });
 
+test('HostToExt: swarm lane lifecycle (open_tab / close_tab) round-trips', () => {
+  const open: HostToExt = {
+    type: 'open_tab',
+    requestId: 'h4',
+    url: 'https://lms.example.com/course/view.php?id=42&c4g_lane=n0-0',
+    active: false,
+  };
+  const openBare: HostToExt = { type: 'open_tab', requestId: 'h5', url: 'https://lms.example.com/x' };
+  const close: HostToExt = { type: 'close_tab', requestId: 'h6', tabId: 77 };
+  assert.deepEqual(roundTrip(parseHostToExt, open), open);
+  assert.deepEqual(roundTrip(parseHostToExt, openBare), openBare);
+  assert.deepEqual(roundTrip(parseHostToExt, close), close);
+});
+
+test('ExtToHost: tab_result round-trips and rejects malformed ids', () => {
+  const ok: ExtToHost = { type: 'tab_result', requestId: 'r1', ok: true, tabId: 77, url: 'https://lms.example.com/x' };
+  const bad: ExtToHost = { type: 'tab_result', requestId: 'r2', ok: false, tabId: -1, url: '', error: 'tabs.create failed' };
+  assert.deepEqual(roundTrip(parseExtToHost, ok), ok);
+  assert.deepEqual(roundTrip(parseExtToHost, bad), bad);
+  for (const g of [
+    { type: 'tab_result', requestId: 'r', ok: true, url: 'https://x/' },
+    { type: 'tab_result', requestId: 'r', ok: true, tabId: 'x', url: 'https://x/' },
+    { type: 'tab_result', requestId: 'r', ok: 'yes', tabId: 1, url: 'https://x/' },
+  ]) {
+    assert.throws(() => parseExtToHost(g), Error, `expected throw for ${JSON.stringify(g)}`);
+  }
+});
+
 test('HostToExt rejects garbage', () => {
   const garbage: unknown[] = [
     undefined,

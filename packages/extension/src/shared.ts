@@ -15,6 +15,8 @@ export const STORAGE = {
   typesafeBaseUrl: 'typesafeBaseUrl',
   typesafeApiKey: 'typesafeApiKey',
   typesafeModel: 'typesafeModel',
+  /** JSON text of the site-plugin list (array of SitePlugin). */
+  pluginsJson: 'pluginsJson',
 } as const;
 
 /** Extension-configurable endpoint fields pushed to the host via config_sync. */
@@ -64,4 +66,11 @@ export async function getConfigPatch(): Promise<Record<string, string>> {
     patch[k] = typeof items[k] === 'string' ? (items[k] as string) : '';
   }
   return patch;
+}
+
+/** Raw site-plugin JSON text as typed in the options page ('' when unset). */
+export async function getPluginsJson(): Promise<string> {
+  const items = await storageGet([STORAGE.pluginsJson]);
+  const v = items[STORAGE.pluginsJson];
+  return typeof v === 'string' ? v : '';
 }

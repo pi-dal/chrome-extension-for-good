@@ -12,6 +12,12 @@
     .hint { color: #666; font-size: 12px; margin: 4px 0 0; }
     button { padding: 4px 12px; margin-top: 8px; }
     #msg { color: #0a7d32; margin-left: 10px; }
+    .plugin-row { border: 1px solid #eee; border-radius: 6px; padding: 6px 8px; margin: 6px 0; }
+    .plugin-head { font-weight: 600; }
+    .plugin-body { color: #555; font-size: 12px; word-break: break-word; }
+    .badge { font-size: 11px; border-radius: 4px; padding: 1px 5px; margin-left: 4px; }
+    .badge.ok { background: #e6f4ea; color: #0a7d32; }
+    .badge.warn { background: #fdf1dc; color: #8a5300; }
   </style>
 </head>
 <body>
@@ -24,24 +30,43 @@
   </section>
 
   <section>
-    <h2>解题 LLM(OpenAI 兼容)</h2>
+    <h2>Quiz LLM (OpenAI-compatible)</h2>
     <label for="solverBaseUrl">Base URL</label>
     <input id="solverBaseUrl" type="text" placeholder="https://open.bigmodel.cn/api/paas/v4" />
     <label for="solverApiKey">API Key</label>
-    <input id="solverApiKey" type="password" placeholder="留空 = 沿用 host .env" />
+    <input id="solverApiKey" type="password" placeholder="blank = use the host .env value" />
     <label for="solverModel">Model</label>
     <input id="solverModel" type="text" placeholder="glm-4.5-flash" />
-    <p class="hint">密钥仅存本机(chrome.storage.local),仅发送给 127.0.0.1 的 host 进程。</p>
+    <p class="hint">Keys stay on this machine (chrome.storage.local) and are only sent to the host process on 127.0.0.1.</p>
   </section>
 
   <section>
-    <h2>Jev 决策(TypeSafe System One)</h2>
+    <h2>Jev decisions (TypeSafe System One)</h2>
     <label for="typesafeBaseUrl">Base URL</label>
     <input id="typesafeBaseUrl" type="text" placeholder="https://api.typesafe.ai" />
     <label for="typesafeApiKey">API Key</label>
-    <input id="typesafeApiKey" type="password" placeholder="留空 = 沿用 host .env" />
+    <input id="typesafeApiKey" type="password" placeholder="blank = use the host .env value" />
     <label for="typesafeModel">Model</label>
     <input id="typesafeModel" type="text" placeholder="jev-latest" />
+  </section>
+
+  <section>
+    <h2>Site plugins (JSON)</h2>
+    <p class="hint">
+      Platform adapters are data: a URL match plus page probes (MAIN world). The built-in
+      LMS plugin is the template; saving pushes the list to the running host over
+      <code>plugins_sync</code> (same ids override the built-ins).
+    </p>
+    <textarea id="plugins" spellcheck="false" rows="18"
+      style="width:100%; box-sizing:border-box; font:12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;"></textarea>
+    <div>
+      <button id="validate" type="button">Validate</button>
+      <button id="template" type="button">Load built-in catalog</button>
+    </div>
+    <h3 style="font-size:13px; margin:14px 0 4px;">Built-in catalog</h3>
+    <div id="catalog">
+      <p class="hint">unverified = derived from a public implementation; check its notes and fill in the missing fields.</p>
+    </div>
   </section>
 
   <button id="save">Save</button><span id="msg"></span>

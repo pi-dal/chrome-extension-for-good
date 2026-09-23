@@ -19,7 +19,7 @@ export interface BridgeStatus {
 }
 
 type PendingResolve = {
-  resolve: (v: Extract<ExtToHost, { type: 'snapshot' | 'action_result' }>) => void;
+  resolve: (v: Extract<ExtToHost, { type: 'snapshot' | 'action_result' | 'tab_result' }>) => void;
   reject: (e: Error) => void;
   timer: NodeJS.Timeout;
 };
@@ -29,12 +29,14 @@ type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K>
 /**
  * WebSocket server the MV3 extension connects to (single client).
  *
- * Host -> extension requests (snapshot/action) are correlated by requestId;
- * extension events and logs surface as EventEmitter events:
- *   'hello'  (TabInfo[] available)
- *   'event'  (ExtToHost event: nav/lms_heartbeat)
- *   'log'    (extension log line)
- *   'status' (connected/disconnected)
+ * Host -> extension requests (snapshot/action/open_tab) are correlated by
+ * requestId; extension events and logs surface as EventEmitter events:
+ *   'hello'   (TabInfo[] available)
+ *   'event'   (ExtToHost event: nav/lms_heartbeat)
+ *   'config'  (HostConfigPatch from the options page)
+ *   'plugins' (SitePlugin[] from the options page)
+ *   'log'     (extension log line)
+ *   'status'  (connected/disconnected)
  */
 export class WsBridge extends EventEmitter {
   private wss: WebSocketServer | null = null;
@@ -110,7 +112,8 @@ export class WsBridge extends EventEmitter {
         this.emit('hello', msg.tabs);
         break;
       case 'snapshot':
-      case 'action_result': {
+      case 'action_result':
+      case 'tab_result': {
         const entry = this.pending.get(msg.requestId);
         if (!entry) {
           this.log('warn', `response for unknown requestId ${msg.requestId}`);
@@ -120,6 +123,7 @@ export class WsBridge extends EventEmitter {
         this.pending.delete(msg.requestId);
         if (msg.type === 'snapshot') entry.resolve(msg);
         else if (msg.type === 'action_result' && !msg.ok) entry.reject(new Error(msg.error ?? 'action failed'));
+        else if (msg.type === 'tab_result' && !msg.ok) entry.reject(new Error(msg.error ?? 'tab operation failed'));
         else entry.resolve(msg);
         break;
       }
@@ -129,6 +133,11 @@ export class WsBridge extends EventEmitter {
       case 'config_sync':
         // Endpoint config pushed by the extension options page (full-state sync).
         this.emit('config', msg.config);
+        break;
+      case 'plugins_sync':
+        // Site plugins pushed by the extension options page (full-state sync);
+        // validated by the protocol parser before they reach this point.
+        this.emit('plugins', msg.plugins);
         break;
       case 'log':
         this.emit('log', msg);
@@ -140,7 +149,9 @@ export class WsBridge extends EventEmitter {
     return this.client !== null && this.client.readyState === WebSocket.OPEN;
   }
 
-  private request(msg: DistributiveOmit<HostToExt, 'requestId'> & { requestId?: string }): Promise<Extract<ExtToHost, { type: 'snapshot' | 'action_result' }>> {
+  private request(
+    msg: DistributiveOmit<HostToExt, 'requestId'> & { requestId?: string },
+  ): Promise<Extract<ExtToHost, { type: 'snapshot' | 'action_result' | 'tab_result' }>> {
     return new Promise((resolve, reject) => {
       if (!this.isConnected()) {
         reject(new Error('extension not connected (is the c4g extension loaded and running?)'));
@@ -194,6 +205,23 @@ export class WsBridge extends EventEmitter {
 
   status(): BridgeStatus {
     return { connected: this.isConnected(), extVersion: this.extVersion, tabs: this.tabs };
+  }
+
+  /**
+   * Open a tab in the user's browser (swarm lane provisioning) and return its
+   * chrome.tabs id — the id every snapshot/action request is keyed by.
+   */
+  async openTab(url: string, opts: { active?: boolean } = {}): Promise<{ tabId: number; url: string }> {
+    const res = await this.request({ type: 'open_tab', url, active: opts.active ?? false });
+    if (res.type !== 'tab_result') throw new Error('unexpected response kind');
+    if (res.tabId < 0) throw new Error('extension returned no tab id for open_tab');
+    return { tabId: res.tabId, url: res.url };
+  }
+
+  /** Close a tab this run created (idempotent from the host's point of view). */
+  async closeTab(tabId: number): Promise<void> {
+    const res = await this.request({ type: 'close_tab', tabId });
+    if (res.type !== 'tab_result') throw new Error('unexpected response kind');
   }
 
   /** Resolves when the extension sends hello (or rejects after timeoutMs). */

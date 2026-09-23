@@ -11,9 +11,18 @@
  * relied upon across SW restarts except chrome.storage.
  */
 
-import { parseExtToHost, parseHostToExt } from '@c4g/protocol';
+import { parseExtToHost, parseHostToExt, parseSitePlugins } from '@c4g/protocol';
 import type { ExtToHost, HostToExt, TabInfo } from '@c4g/protocol';
-import { CONFIG_KEYS, STORAGE, getConfigPatch, getHostPort, storageSet, truncate, wsUrlFor } from './shared.js';
+import {
+  CONFIG_KEYS,
+  STORAGE,
+  getConfigPatch,
+  getHostPort,
+  getPluginsJson,
+  storageSet,
+  truncate,
+  wsUrlFor,
+} from './shared.js';
 
 const MAX_BACKOFF_MS = 30_000;
 const PING_INTERVAL_MS = 20_000;
@@ -70,6 +79,31 @@ async function sendConfigSync(reason: string): Promise<void> {
   if (sent) console.debug(`[c4g-bg] config_sync sent (${reason})`);
 }
 
+/**
+ * Push the site-plugin list to the host (full-state sync). Validated with the
+ * protocol parser first: an invalid list is reported and simply not pushed, so
+ * the host keeps its previous plugins instead of losing platform support.
+ */
+async function sendPluginsSync(reason: string): Promise<void> {
+  const text = (await getPluginsJson()).trim();
+  let plugins;
+  try {
+    // An empty box means "built-ins only": push [] so the host resets, rather
+    // than silently keeping a plugin list the operator just cleared.
+    plugins = text === '' ? [] : parseSitePlugins(JSON.parse(text));
+  } catch (err) {
+    sendRaw({
+      type: 'log',
+      level: 'warn',
+      msg: 'site plugins from options page are invalid — not pushed',
+      data: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+  const sent = sendRaw({ type: 'plugins_sync', plugins });
+  if (sent) console.debug(`[c4g-bg] plugins_sync sent (${reason}), ${plugins.length} plugin(s)`);
+}
+
 // ---------------------------------------------------------------------------
 // connect / reconnect / keepalive
 // ---------------------------------------------------------------------------
@@ -114,6 +148,7 @@ async function connect(): Promise<void> {
     startPing();
     void sendHello('ws-open');
     void sendConfigSync('ws-open');
+    void sendPluginsSync('ws-open');
   };
   ws.onmessage = (ev: MessageEvent) => {
     if (typeof ev.data === 'string') void handleHostText(ev.data);
@@ -139,6 +174,46 @@ function asEnvelope(resp: unknown): ExtToHost | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Swarm lane lifecycle. `open_tab` is how the host gets a chrome.tabs id for a
+ * lane it just created (CDP alone could not map a target back to that id);
+ * `close_tab` tears the lane down again. Backgrounded by default so the user's
+ * current tab keeps focus — the host arms per-lane keep-alive separately.
+ */
+function handleTabOp(msg: Extract<HostToExt, { type: 'open_tab' | 'close_tab' }>): Promise<ExtToHost> {
+  return new Promise((resolve) => {
+    const fail = (error: string, tabId = -1, url = ''): void =>
+      resolve({ type: 'tab_result', requestId: msg.requestId, ok: false, tabId, url, error });
+    try {
+      if (msg.type === 'open_tab') {
+        chrome.tabs.create({ url: msg.url, active: msg.active ?? false }, (tab) => {
+          const err = chrome.runtime.lastError;
+          if (err) fail(err.message ?? 'tabs.create failed');
+          else if (!tab || tab.id === undefined) fail('tabs.create returned no tab id');
+          else {
+            resolve({
+              type: 'tab_result',
+              requestId: msg.requestId,
+              ok: true,
+              tabId: tab.id,
+              url: tab.url ?? msg.url,
+            });
+          }
+        });
+      } else {
+        chrome.tabs.remove(msg.tabId, () => {
+          const err = chrome.runtime.lastError;
+          // Closing an already-gone tab is a success for the host's purposes.
+          if (err) fail(err.message ?? 'tabs.remove failed', msg.tabId);
+          else resolve({ type: 'tab_result', requestId: msg.requestId, ok: true, tabId: msg.tabId, url: '' });
+        });
+      }
+    } catch (err) {
+      fail(String(err));
+    }
+  });
 }
 
 function routeToTab(
@@ -170,6 +245,13 @@ async function handleHostText(text: string): Promise<void> {
     msg = parseHostToExt(JSON.parse(text));
   } catch (err) {
     sendRaw({ type: 'log', level: 'warn', msg: 'invalid host message', data: String(err) });
+    return;
+  }
+
+  // Tab lifecycle requests are answered by the service worker itself — they are
+  // not addressed to a content script, so they must not go through routeToTab.
+  if (msg.type === 'open_tab' || msg.type === 'close_tab') {
+    sendRaw(await handleTabOp(msg));
     return;
   }
 
@@ -259,6 +341,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
     return;
   }
   if (CONFIG_KEYS.some((k) => changes[k])) void sendConfigSync('storage-changed');
+  if (changes[STORAGE.pluginsJson]) void sendPluginsSync('storage-changed');
 });
 
 // Safety net: if the SW was suspended while the host is down (no ping keeping it
