@@ -192,12 +192,21 @@ export class CdpTab {
     return new CdpTab(conn, target.id);
   }
 
+  /** Internal factory for module-level helpers that already hold a connection. */
+  static fromConnection(conn: CdpConnection, targetId: string): CdpTab {
+    return new CdpTab(conn, targetId);
+  }
+
   /** Runtime.evaluate with returnByValue; throws on JS exceptions. */
-  async evaluate<T = unknown>(expression: string, { awaitPromise = false } = {}): Promise<T> {
+  async evaluate<T = unknown>(
+    expression: string,
+    { awaitPromise = false, userGesture = false } = {},
+  ): Promise<T> {
     const result = (await this.send('Runtime.evaluate', {
       expression,
       returnByValue: true,
       awaitPromise,
+      userGesture,
     })) as {
       result?: { value?: unknown };
       exceptionDetails?: { exception?: { description?: string }; text?: string };
@@ -206,6 +215,40 @@ export class CdpTab {
       throw new Error('Evaluate error: ' + (result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? 'unknown'));
     }
     return result.result?.value as T;
+  }
+
+  /**
+   * Register a script that runs in the MAIN world of every future document of
+   * this target (swarm lane keep-alive). Returns the CDP script identifier.
+   */
+  async addInitScript(source: string): Promise<string> {
+    await this.send('Page.enable');
+    const res = (await this.send('Page.addScriptToEvaluateOnNewDocument', { source })) as {
+      identifier?: string;
+    };
+    return res.identifier ?? '';
+  }
+
+  /** Pretend this page is focused (players gate playback on focus/blur). */
+  async setFocusEmulation(enabled: boolean): Promise<void> {
+    await this.send('Emulation.setFocusEmulationEnabled', { enabled });
+  }
+
+  /** Pin the page lifecycle to 'active' so Chrome never freezes a lane tab. */
+  async setLifecycleState(state: 'active' | 'frozen'): Promise<void> {
+    await this.send('Page.enable');
+    await this.send('Page.setWebLifecycleState', { state });
+  }
+
+  /**
+   * Background-tab survival kit for a swarm lane: run `source` (the lane
+   * keep-alive script, owned by swarm.ts) in the MAIN world of every future
+   * document, emulate focus, and pin the lifecycle to 'active'.
+   */
+  async armKeepAlive(source: string): Promise<void> {
+    await this.addInitScript(source);
+    await this.setFocusEmulation(true);
+    await this.setLifecycleState('active');
   }
 
   /** Page.navigate + wait for loadEventFired (soft cap; some pages never fire load). */
@@ -261,5 +304,82 @@ export class CdpTab {
 
   close(): void {
     this.conn.close();
+  }
+}
+
+export interface ConnectToMarkerOptions {
+  /** Total budget for the target to appear (tab creation + first navigation). */
+  timeoutMs?: number;
+  intervalMs?: number;
+}
+
+/**
+ * Attach to the page target whose URL contains `marker`, retrying until the
+ * deadline. Swarm lanes park new tabs on a URL carrying a per-run marker so a
+ * freshly created extension tab can be matched to its CDP target without
+ * guessing (urls of two lanes are never identical).
+ */
+export async function connectToMarker(
+  port: number,
+  marker: string,
+  { timeoutMs = 15_000, intervalMs = 250 }: ConnectToMarkerOptions = {},
+): Promise<CdpTab> {
+  const deadline = Date.now() + timeoutMs;
+  let seen: string[] = [];
+  for (;;) {
+    const targets = await listTargets(port);
+    const pages = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
+    const match = pages.find((t) => t.url.includes(marker));
+    if (match) {
+      const conn = await CdpConnection.connect(match.webSocketDebuggerUrl!);
+      return CdpTab.fromConnection(conn, match.id);
+    }
+    seen = pages.map((t) => t.url.slice(0, 60));
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `no CDP page target matched lane marker "${marker}" within ${timeoutMs / 1000}s — saw: ${seen.join(' | ') || '(none)'}`,
+      );
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/** Page-target ids right now — the "before" set for new-target detection. */
+export async function listPageTargetIds(port: number): Promise<string[]> {
+  const targets = await listTargets(port);
+  return targets.filter((t) => t.type === 'page').map((t) => t.id);
+}
+
+/**
+ * The page target that appeared after `beforeIds` was captured. Pure so the
+ * matching rule is testable; `connectToNewPage` does the IO around it.
+ */
+export function pickNewTarget(targets: CdpTargetInfo[], beforeIds: readonly string[]): CdpTargetInfo | null {
+  const known = new Set(beforeIds);
+  return targets.find((t) => t.type === 'page' && !!t.webSocketDebuggerUrl && !known.has(t.id)) ?? null;
+}
+
+/**
+ * Fallback lane attach for a tab whose park URL no longer carries the marker
+ * (redirect to a login or consent page). The tab is still the one new page
+ * target that appeared since the tab was opened.
+ */
+export async function connectToNewPage(
+  port: number,
+  beforeIds: readonly string[],
+  { timeoutMs = 10_000, intervalMs = 250 }: ConnectToMarkerOptions = {},
+): Promise<CdpTab> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const targets = await listTargets(port);
+    const fresh = pickNewTarget(targets, beforeIds);
+    if (fresh) {
+      const conn = await CdpConnection.connect(fresh.webSocketDebuggerUrl!);
+      return CdpTab.fromConnection(conn, fresh.id);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`no new CDP page target appeared within ${timeoutMs / 1000}s (tab was never created?)`);
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
 }
