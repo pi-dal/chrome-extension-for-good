@@ -35,6 +35,19 @@ describe('L1 recipe confirmation (review F5c)', () => {
     assert.ok(!expr.includes("'"), 'selector must be double-quoted, never raw');
   });
 
+  it('membership probe evaluates to an ARRAY and survives the transport', () => {
+    const expr = buildMembershipProbeExpression('.answer', [1, 2, 3]);
+    const window_ = {
+      __c4gRef: (i: number) => ({ matches: (sel: string) => sel === '.answer' && (i === 1 || i === 3) }),
+    };
+    const fn = new Function('window', `return (${expr});`);
+    const value = fn(window_);
+    // Regression: a JSON.stringify wrapper here made Array.isArray(flags) false
+    // in production, so L1 recipe confirmation could never succeed.
+    assert.deepEqual(value, [1, 0, 1]);
+    assert.deepEqual(JSON.parse(JSON.stringify(value)), [1, 0, 1]);
+  });
+
   it('confirms when counts and membership match', async () => {
     const capture = loadCapture('moodle-like');
     const { heuristicGroup } = await import('../../src/inspect/heuristic.js');

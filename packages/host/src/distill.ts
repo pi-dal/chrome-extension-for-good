@@ -16,7 +16,7 @@ import type { InspectionResult, PageCapture, QuizRecipe } from '@c4g/protocol';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
-// selector safety policy (§3)
+// selector grammar policy (§3)
 // ---------------------------------------------------------------------------
 
 const SELECTOR_MAX_LEN = 300;
@@ -43,7 +43,12 @@ export function buildCountProbeExpression(selector: string): string {
   const safe = assertSafeSelector(selector);
   // JSON.stringify(safe) yields a JS string literal — quotes escaped, so the
   // selector can never terminate the literal and inject code.
-  return `JSON.stringify(document.querySelectorAll(${JSON.stringify(safe)}).length)`;
+  //
+  // CONTRACT: the expression evaluates to a NUMBER. The transport already
+  // serializes whatever the page returns (content.ts JSON.stringify → host
+  // JSON.parse), so wrapping it here would double-encode and hand consumers the
+  // string "3" instead of 3 — every count comparison would then fail silently.
+  return `document.querySelectorAll(${JSON.stringify(safe)}).length`;
 }
 
 // ---------------------------------------------------------------------------

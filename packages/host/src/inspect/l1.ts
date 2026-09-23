@@ -21,13 +21,19 @@ export interface L1Deps {
   evalJson(expression: string): Promise<unknown | null>;
 }
 
-/** indices.map(i => __c4gRef(i)?.matches(selector) ? 1 : 0) as a probe expression. */
+/**
+ * indices.map(i => __c4gRef(i)?.matches(selector) ? 1 : 0) as a probe expression.
+ *
+ * CONTRACT: the expression evaluates to an ARRAY of 0/1. The transport already
+ * serializes the page's value, so a JSON.stringify wrapper here would hand the
+ * consumers a string and silently break membership confirmation.
+ */
 export function buildMembershipProbeExpression(selector: string, indices: number[]): string {
   const safe = assertSafeSelector(selector);
   return (
-    `JSON.stringify(${JSON.stringify(indices)}.map(function(i){` +
+    `${JSON.stringify(indices)}.map(function(i){` +
     `var el=(window.__c4gRef&&window.__c4gRef(i))||null;` +
-    `return el&&el.matches?el.matches(${JSON.stringify(safe)})?1:0:0;}))`
+    `return el&&el.matches?el.matches(${JSON.stringify(safe)})?1:0:0;})`
   );
 }
 

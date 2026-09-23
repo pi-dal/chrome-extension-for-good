@@ -62,7 +62,7 @@ function domAncestrySource(selector: string): { source: { ancestryOf(i: number):
 
 // ---------------------------------------------------------------------------
 
-describe('selector safety policy (design §3)', () => {
+describe('selector grammar policy (design §3)', () => {
   it('accepts plain CSS selector vocabulary', () => {
     assert.equal(assertSafeSelector('div.quiz-item > p.qtext'), 'div.quiz-item > p.qtext');
     assert.equal(assertSafeSelector('input[type="radio"]'), 'input[type="radio"]');
@@ -84,11 +84,17 @@ describe('selector safety policy (design §3)', () => {
     assert.equal((expr.match(/document.querySelectorAll/g) ?? []).length, 1);
   });
 
-  it('probe expressions actually evaluate against a DOM', () => {
+  it('count probes evaluate to a NUMBER and survive the transport round-trip', () => {
     const expr = buildCountProbeExpression('p.qtext');
-    const fn = new Function('document', `return ${expr};`);
-    // probes return JSON-encoded values; the host evalJson layer parses them
-    assert.equal(JSON.parse(fn(document)), 3);
+    const fn = new Function('document', `return (${expr});`);
+    const value = fn(document);
+    // Regression: the builder used to wrap the count in JSON.stringify, and the
+    // content script serializes the page value anyway — so the host received
+    // the string "3" and every `count !== n` comparison failed silently.
+    assert.equal(typeof value, 'number');
+    assert.equal(value, 3);
+    // what the host's evalJson actually sees: one serialize/parse hop
+    assert.equal(JSON.parse(JSON.stringify(value)), 3);
   });
 });
 
