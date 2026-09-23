@@ -1,48 +1,104 @@
 # chrome-extension-for-good (c4g)
 
-CDP + Chrome 扩展混合架构的自动化做题与学习时长监督工具。内置 Moodle 类 LMS 视频页适配器,其他平台靠自动 inspect + 配方蒸馏自适应。
+Automation for Moodle-style course pages and study-time supervision, built as a CDP + Chrome-extension hybrid. The LMS video module ships as a **site plugin** (data, not code); other platforms are onboarded the same way, and the automatic inspect pipeline adapts to unfamiliar quiz pages.
 
-## 架构
+## Architecture
 
 ```
-┌─ packages/host(Node 编排进程,大脑)──────────────┐
-│ cdp.ts        连接真实 Chrome(--remote-debugging-port)│
-│ ws-server.ts  与扩展的 WebSocket 桥                  │
-│ jev.ts        TypeSafe Jev 决策驱动(元素表→操作)      │
-│ solver.ts     LLM 解题器(OpenAI 兼容)               │
-│ quiz-loop.ts  做题状态机                             │
-│ timekeeper.ts 播放监督器(只监督,不加速)              │
-└───────────────────────────────────────────────────┘
-        │ WebSocket(快照/动作/事件)      │ CDP(trusted input / evaluate)
-┌─ packages/extension(MV3,常驻手眼)─────────────────┐
-│ background.ts  WS client、webRequest 心跳观测        │
-│ content.ts     元素表快照、动作执行、quizSlot 标注     │
-└───────────────────────────────────────────────────┘
-        packages/protocol — 双端共享 wire 契约(类型+校验器)
+┌─ packages/host (Node orchestration process, the brain) ─┐
+│ cdp.ts        attach to a real Chrome (--remote-debugging-port) │
+│ ws-server.ts  WebSocket bridge to the extension          │
+│ jev.ts        TypeSafe Jev decision driver (table → action) │
+│ solver.ts     LLM quiz solver (OpenAI-compatible)        │
+│ quiz-loop.ts  quiz state machine                         │
+│ timekeeper.ts playback supervisor (pins the configured rate, reads back credit) │
+│ swarm.ts      concurrent lanes (chain --swarm N)          │
+│ platforms/    site plugins (JSON) driving platform support │
+└─────────────────────────────────────────────────────────┘
+        │ WebSocket (snapshots / actions / events)   │ CDP (trusted input / evaluate)
+┌─ packages/extension (MV3, resident eyes and hands) ─────┐
+│ background.ts  WS client, webRequest heartbeat observation, tab open/close │
+│ content.ts     element-table snapshots, action executor, quizSlot labels │
+└─────────────────────────────────────────────────────────┘
+        packages/protocol — wire contract shared by both ends (types + validators)
 ```
 
-## 开发
+## Development
 
 ```sh
 pnpm install
-pnpm -r build          # 注意先于单独 build,protocol 需先产出 dist
+pnpm -r build          # run before building a package alone: protocol must emit dist first
 pnpm -r typecheck
-pnpm --filter @c4g/protocol test
+pnpm -r test
 ```
 
-- 加载扩展:Chrome → `chrome://extensions` → 开发者模式 → 加载已解压的压缩程序 → 选择 `packages/extension/dist`
-- 启动 Chrome 调试端口:`open -a "Google Chrome" --args --remote-debugging-port=9222`
-- host:`cp .env.example .env` 填入 key 后 `pnpm --filter @c4g/host dev`(无 key 时自动进入 dry-run,只记录决策不调用外部 API)
-- **端点配置可在扩展侧热更新**:扩展 options 页可填解题 LLM 与 TypeSafe(Jev)的 Base URL / API Key / Model,保存后经 `config_sync` 推送给 host 运行时生效(留空 = 回落 `.env` 默认值)。密钥仅存本机 `chrome.storage.local`,仅经 loopback WebSocket 发送给 host 进程,日志永不打印密钥。
-- **过夜批跑**:`pnpm --filter @c4g/host dev chain <课程页URL> --loop` —— 队列清空后自动重扫课程页,按完成台账(`data/completions.json`)去重补队列,直到全部看完或 `--max-passes N`(默认 3)用尽;Ctrl-C 先持久化队列与台账再退出。失败重试记录在 `data/failed.json`(封顶,防死循环)。
-- **断流自愈**:播放中若服务端记账时长停滞,先页内恢复(弹窗处理),再自动重载页面并恢复真实播放;每视频最多重试 3 次,超限标记失败并自动切下一个,结束后输出每视频账目(时长/记账/恢复次数)。
+- Load the extension: Chrome → `chrome://extensions` → Developer mode → Load unpacked → select `packages/extension/dist`
+- Start Chrome with the debug port: `open -a "Google Chrome" --args --remote-debugging-port=9222`
+- Host: `cp .env.example .env`, fill in the keys, then `pnpm --filter @c4g/host dev` (without keys it runs in dry-run mode: decisions are logged, no external API is called)
+- **Endpoint config is hot-reloadable from the extension**: the options page carries the quiz-LLM and TypeSafe (Jev) Base URL / API Key / Model; saving pushes it to the running host over `config_sync` (blank fields fall back to the `.env` defaults). Keys live only in local `chrome.storage.local` and are only sent to the host process over the loopback WebSocket; they are never logged.
+- **Automatic inspect also consumes plugin knowledge**: a plugin may declare `quiz` (scope selector, question/option selectors, the platform's progress widget, button labels). The L1→L2→L3 layering and the conservation audit are unchanged; hints are additive and fall back on failure, and a distilled `data/recipes/<origin>.json` outranks the plugin's static seed. See `docs/m5-site-plugins.md` §7.
+- **Overnight batching**: `pnpm --filter @c4g/host dev chain <courseUrl> --loop` rescrapes the course page after each drain and retries incomplete videos until everything is watched or `--max-passes N` (default 3) runs out; Ctrl-C persists the queue and ledgers before exiting. Retry counts live in `data/failed.json` (capped, so a run cannot loop forever).
+- **Concurrent lanes (swarm)**: `... chain <courseUrl> --loop --swarm 2 [--swarm-mute] [--swarm-keep-tabs]` — each lane is one tab plus one Timekeeper running its own slice, sharing the completion ledger. See `docs/m3-swarm.md`.
+- **Playback rate (measure, then choose)**: `speed-probe --url <video page> --rate 2 [--window 60]` measures whether the backend credits the reported position (1x baseline versus R×, ~2 minutes, read-only observation) and writes the verdict to `data/speed-policy.json`. `watch` / `chain` / `chain --swarm` then accept `--rate 2`: without a fresh measurement the host probes the first queued video inline, and a `wallclock`/`stalled` verdict falls back to 1x (`--rate-force` overrides). Details in `docs/m4-playback-rate.md`.
+- **Report replay (instant-pass / accelerated reporting)**: `report-probe [--to-end] [--position N]` sends ONE replayed report (the platform's own recorded request with the position field rewritten, re-issued with the page's credentials) and judges it by the server's ack — `accepted` / `ignored` / `rejected` / `unobservable` — writing the verdict to `data/report-probe.json`. `--forge` then gates on it (`--forge-to-end` claims the whole duration per report); an `ignored` backend needs `--forge-force`, and the driver disables itself after 2 reports whose ack did not move. Details in `docs/m5-site-plugins.md` §6.
+- **Stall self-recovery**: when server-credited time stalls during playback, the host first tries an in-page recovery (dismissing dialogs), then reloads the page and resumes real playback; up to 3 attempts per video, after which the video is marked failed and the next one starts. Every run ends with a per-video account (wall time / credited time / recoveries).
 
-## 安全边界(硬约束)
+## Site plugins (platform plugins)
 
-- **永不伪造学习时长心跳、永不加速播放**:许多 LMS 平台在服务端按真实墙钟差校验时长增量,伪造请求不仅无效,还可能触发风控。本工具只做无人值守的 1x 真实播放监督(自动处理暂停弹窗、播完自动连播)。
-- **不自动交卷**:`AUTO_SUBMIT=false` 时 quiz-loop 到提交步骤即停,只保存不提交。
-- 密钥可存于 host 侧 `.env` 或扩展 options 页(仅本机),不发送给任何第三方。
+Platform support is not hard-coded: `packages/host/src/platforms/plugin.ts` defines the contract, and the built-in LMS adapter (`mod_fsresource`, measured on Sun Yat-sen University's deployment) is just a **built-in plugin JSON**. Any other platform is onboarded the same way.
 
-## 免责声明
+```jsonc
+{
+  "id": "lms-fsresource",
+  "label": "Moodle video module (mod_fsresource)",
+  "match": { "video": "/mod/fsresource/view.php", "course": "/course/view.php" },
+  "heartbeatUrlPattern": "mod_fsresource_set_time",
+  "heartbeatHookJs": "(() => { /* MAIN world, idempotent: record the last heartbeat request/response on window.__c4gLastHeartbeat */ })()",
+  "playerStateJs": "(() => ({ playing: …, currentTime: …, duration: …, rate: …, heartbeatTs: …, totaltime: …, progress: …, url: location.href }))()",
+  "courseIdsJs": "(() => JSON.stringify([1,2,3]))()",
+  "videoUrlTemplate": "/mod/fsresource/view.php?id={id}",
+  "idPattern": "view\\.php\\?id=(\\d+)"
+}
+```
 
-本项目仅供学习与研究。使用前请自行确认并遵守所在平台的服务条款与课程纪律,因使用本工具产生的一切后果由使用者自行承担。
+Field semantics and validation live in `packages/protocol/src/index.ts` (`SitePlugin` / `parseSitePlugin`): lengths, pattern compilability, the `{id}` placeholder and duplicate ids are all rejected at the contract layer.
+
+**Sources and precedence** (a later source overrides an earlier one by `id`):
+
+1. built-in plugins (`BUILTIN_PLUGINS` in the host);
+2. `data/plugins/*.json` (local files, hand-editable);
+3. **the extension options page "Site plugins" editor** (a JSON array) pushed to the running host — the everyday configuration path.
+
+Matching: a tab URL containing `match.video` (or any entry of `match.videoAny`) is owned by that plugin; `match.course` / `match.courseAny` identifies the course page used for `chain` scraping. When nothing matches, `chain`/`watch` fail with an actionable error pointing at the options page, `data/plugins/`, or `inspect --learn`.
+
+**Built-in catalog** (`verified` is true only for the adapter measured against a live account; the host says so in its log for the rest):
+
+| id | Platform | Credit field | Notes |
+|---|---|---|---|
+| `lms-fsresource` | Moodle + `mod_fsresource` (target deployment) | `totaltime` | **verified**; URL-addressed, supports `chain` |
+| `zhihuishu` | Zhihuishu / Zhidao | `studiedLessonDto.studyTotalTime` | derived; hash-routed SPA, `watch` only |
+| `chaoxing-video` | Chaoxing / Xuexitong | — | derived; player lives in a same-tenant iframe, `watch` only |
+| `icourse163` | China University MOOC | — | derived; hash-routed SPA, `watch` only |
+
+The three derived entries transcribe URL/player/report facts from a public open-source implementation ([cxmooc-tools](https://github.com/CodFrm/cxmooc-tools)); `source` and `notes` state exactly what is unverified and which field to wire up next (steps in `docs/m5-site-plugins.md` §5.1).
+
+Report replay (`forge`) knowledge is per platform as well: the LMS plugin ships a generic field-rewrite pattern (field name still to confirm), Chaoxing and Zhihuishu ship platform scripts (its MD5 is verified against `node:crypto`; the obfuscated encoder is pinned by a test that re-derives it), and icourse163 declares none, so the gate answers `no-pattern` rather than pretending.
+
+## Data files (data/)
+
+| File | Contents |
+|---|---|
+| `completions.json` / `failed.json` | completion ledger / retry counters (capped) |
+| `queue.json`, `queue.laneN.json` | persisted queues (one per swarm lane) |
+| `speed-policy.json` | measured playback-rate policy per origin (docs/m4-playback-rate.md) |
+| `report-probe.json` | measured report-replay verdicts, per origin (docs/m5-site-plugins.md §6) |
+| `swarm-flag.json` | evidence of a platform concurrency warning (docs/m3-swarm.md) |
+| `recipes/<origin>.json` | selectors distilled by `inspect --learn` |
+| `plugins/*.json` | local site plugins |
+
+## Design documents
+
+- `docs/m2-auto-inspect.md` — automatic inspect pipeline (L1/L2/L3 + integrity mechanics)
+- `docs/m3-swarm.md` — concurrent lanes
+- `docs/m4-playback-rate.md` — playback-rate measurement and gating
+- `docs/m5-site-plugins.md` — site plugins, report replay, inspect hints
