@@ -4,9 +4,9 @@ import { fileURLToPath } from 'node:url';
 import type { Rect } from '@c4g/protocol';
 import type { JevDecision, JeDriver } from './jev.js';
 import type { LogFn } from './log.js';
-import type { PlayerState } from './platforms/moodle-video.js';
-import { installHeartbeatHook, isVideoPage } from './platforms/moodle-video.js';
 import { detectHeartbeat, installRingBuffer, readRing } from './observe.js';
+import type { PlayerState } from './platforms/plugin.js';
+import { clampRate } from './speed-policy.js';
 import type { WsBridge } from './ws-server.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -27,6 +27,9 @@ export interface TimekeeperDeps {
     scrapeCourseVideoIds(tab: TimekeeperDeps['cdp']): Promise<number[]>;
     /** Known heartbeat URL fragment — fast path; generic detection is skipped. */
     heartbeatUrlPattern?: string;
+    /** Site-plugin URL handling; falls back to the built-in LMS shape. */
+    videoUrl?(id: number): string;
+    idFromUrl?(url: string): number | null;
   };
   log: LogFn;
   intervalMs?: number;
@@ -35,6 +38,24 @@ export interface TimekeeperDeps {
   maxRecovery?: number;
   /** Give up on a video after this many consecutive never-played ticks (review F3). */
   maxNotPlayingTicks?: number;
+  /**
+   * Playback rate to hold (default 1x). Above 1x this is an OPERATOR choice
+   * that must be backed by a measurement (see speed-probe.ts / speed-policy.ts):
+   * the host never invents a rate, it only keeps the page at the configured one.
+   */
+  rate?: number;
+  /**
+   * Swarm lane seam: runs after EVERY navigation to a new document (first
+   * video, chaining, stall reload). Swarm lanes use it to re-arm keep-alive,
+   * apply the mute policy and nudge playback; single-lane mode leaves it unset.
+   * Best-effort — a failure is logged, never fatal to supervision.
+   */
+  onPageReady?: () => Promise<void>;
+  /**
+   * Per-tick seam (swarm lanes use onPageReady; report replay uses this one).
+   * Runs after the player state was read; best-effort, never fatal.
+   */
+  onTick?: () => Promise<void>;
 }
 
 /** Outcome of supervising one video to a terminal state. */
@@ -45,6 +66,8 @@ export interface WatchOutcome {
   wallSeconds: number; // wall-clock seconds spent on this video
   creditedDeltaSeconds: number | null; // server totaltime delta observed; null if unverifiable
   recoveries: number; // stall-recovery attempts used
+  /** Playback rate this video was supervised at (1 = default). */
+  rate?: number;
 }
 
 export type TickOutcome =
@@ -96,17 +119,19 @@ function idFromUrl(url: string): number | null {
 /**
  * Unattended real-time playback supervisor for Moodle-based LMS video pages.
  *
- * DESIGN CONSTRAINTS (see platforms/moodle-video.ts): several LMS servers cap
- * credited time against the real wall-clock delta and reject concurrent
- * videos, so this supervisor NEVER forges heartbeats, NEVER accelerates
- * playback, and NEVER runs videos concurrently. It only:
- *   - keeps the current video genuinely playing at 1x (auto-dismiss dialogs
- *     via snapshot + Jev),
- *   - on server-credit stalls: attempts bounded recovery (in-page resume,
- *     then page reload + resume) — never by forging requests or speeding up
- *     playback — and gives up on the video after maxRecovery attempts,
- *   - verifies server-credited totaltime keeps advancing (read-back only),
- *   - chains to the next queued video when one finishes.
+ * What it does, in one tick: read the player state through the site plugin,
+ * keep playback going (auto-dismiss dialogs via snapshot + Jev when paused),
+ * read back the server-credited totaltime, recover bounded stalls (in-page
+ * resume, then reload), and chain to the next queued video when one finishes.
+ *
+ * Three things it deliberately does NOT decide:
+ *   - the playback rate: the page is pinned to deps.rate (see speed-policy.ts),
+ *     and above 1x a video only counts as finished when the SERVER confirms it
+ *     (the client clock races ahead of the ledger when accelerated);
+ *   - concurrency: one instance drives exactly one tab; `chain --swarm N`
+ *     creates N instances (see swarm.ts);
+ *   - which platform it is talking to: deps.platform resolves a site plugin by
+ *     the tab's URL on every call (platforms/registry.ts).
  */
 export class Timekeeper {
   private queue: number[] = [];
@@ -139,6 +164,21 @@ export class Timekeeper {
 
   private get maxNotPlayingTicks(): number {
     return this.deps.maxNotPlayingTicks ?? 6;
+  }
+
+  /** The rate this instance keeps the page at (operator-configured). */
+  /** Video page URL for a resource id, via the platform's plugin when it has one. */
+  private videoUrl(id: number): string {
+    return this.deps.platform.videoUrl?.(id) ?? videoUrl(id);
+  }
+
+  /** Resource id of the current page, via the platform's plugin when it has one. */
+  private idFromUrl(url: string): number | null {
+    return this.deps.platform.idFromUrl?.(url) ?? idFromUrl(url);
+  }
+
+  private get targetRate(): number {
+    return clampRate(this.deps.rate ?? 1);
   }
 
   // ---------------------------------------------------------------- persistence
@@ -273,19 +313,25 @@ export class Timekeeper {
         return { kind: 'idle', detail: 'queue empty — all videos done' };
       }
       log('info', `timekeeper: navigating to video ${next}`);
-      await cdp.navigate(videoUrl(next));
-      await platform.installHeartbeatHook(cdp);
+      await cdp.navigate(this.videoUrl(next));
+      await this.preparePage();
       this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
     }
 
     const state = await platform.readPlayerState(cdp);
-    const currentId = idFromUrl(url);
+    const currentId = this.idFromUrl(url);
 
-    // Anti-acceleration guard: never allow >1x playback on our watch.
-    if (state.rate > 1.01) {
-      log('warn', `timekeeper: playbackRate ${state.rate} detected — restoring 1x (acceleration is not credited by the server)`);
-      await cdp.evaluate('(() => { const v = document.querySelector("video"); if (v) v.playbackRate = 1; return true; })()');
+    // Rate guard: hold the page at the configured rate. The host never invents
+    // a rate — above 1x the run only happens because the operator asked for it
+    // after a measurement (speed-policy.ts), and any drift is undone here.
+    const configured = this.targetRate;
+    if (state.rate > 0 && Math.abs(state.rate - configured) > 0.01) {
+      log(
+        state.rate > configured ? 'warn' : 'debug',
+        `timekeeper: playbackRate ${state.rate} ≠ configured ${configured} — restoring`,
+      );
+      await cdp.evaluate(`(() => { const v = document.querySelector("video"); if (v) v.playbackRate = ${configured}; return true; })()`);
     }
 
     // Stalled playback → dismiss dialogs / press play via snapshot + Jev.
@@ -304,7 +350,7 @@ export class Timekeeper {
       // progression to compare), so enforce its own bound here. The counter is
       // deliberately NOT reset on resume-blocked ticks.
       if (this.consecutiveNotPlaying >= this.maxNotPlayingTicks) {
-        const id = idFromUrl(url);
+        const id = this.idFromUrl(url);
         if (id !== null) {
           return await this.abandonVideo(id, `never started playing after ${this.consecutiveNotPlaying} ticks`);
         }
@@ -316,6 +362,13 @@ export class Timekeeper {
 
     // Playing — watch server-credited time progression.
     this.consecutiveNotPlaying = 0;
+    if (this.deps.onTick) {
+      try {
+        await this.deps.onTick();
+      } catch (err) {
+        log('debug', `timekeeper: tick hook failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     // Generic heartbeat observability (design §4.4): platforms without a known
     // heartbeat pattern get passive frequency detection over the XHR ring.
     // Strictly read-only — nothing is ever replayed or forged.
@@ -358,7 +411,7 @@ export class Timekeeper {
         log('warn', `timekeeper: totaltime stalled at ${state.totaltime}s — recovery #${this.stallRecoveries}: reloading video page`);
         const currentUrl = await cdp.url();
         await cdp.navigate(currentUrl);
-        await platform.installHeartbeatHook(cdp);
+        await this.preparePage();
         this.resetPlaybackWatch(false);
       }
       this.ticksAtSameTotalTime = 0;
@@ -367,11 +420,17 @@ export class Timekeeper {
     }
 
     // Finished → mark done, chain to next.
+    const clientFinished = state.currentTime >= state.duration - 3;
+    const serverFinished =
+      (state.progress !== null && state.progress >= 99) ||
+      (state.totaltime !== null && state.totaltime >= state.duration - 3);
+    const serverReadable = state.progress !== null || state.totaltime !== null;
+    // At 1x the client clock is a faithful proxy for what the ledger sees.
+    // Above 1x it is NOT — the player races ahead of the account, so a video is
+    // only "finished" when the server's own ack says so (unreadable → fall back
+    // to the client clock rather than hanging forever).
     const finished =
-      state.duration > 0 &&
-      (state.currentTime >= state.duration - 3 ||
-        (state.progress !== null && state.progress >= 99) ||
-        (state.totaltime !== null && state.totaltime >= state.duration - 3));
+      state.duration > 0 && (this.targetRate > 1.001 ? serverFinished || !serverReadable : clientFinished || serverFinished);
     if (finished && currentId !== null) {
       log('info', `timekeeper: video ${currentId} finished (currentTime=${state.currentTime.toFixed(0)}s/${state.duration.toFixed(0)}s, totaltime=${state.totaltime ?? '?'})`);
       this.done.add(currentId);
@@ -384,13 +443,29 @@ export class Timekeeper {
         this.stop();
         return { kind: 'idle', detail: 'queue drained' };
       }
-      await cdp.navigate(videoUrl(next));
-      await platform.installHeartbeatHook(cdp);
+      await cdp.navigate(this.videoUrl(next));
+      await this.preparePage();
       this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
     }
 
     return { kind: 'none', detail: `playing ${state.currentTime.toFixed(0)}/${state.duration.toFixed(0)}s totaltime=${state.totaltime ?? '?'}` };
+  }
+
+  /**
+   * Per-document setup after ANY navigation: platform heartbeat hook first
+   * (read-only), then the optional lane policy (swarm keep-alive / mute / play
+   * nudge). The lane policy is best-effort — a failure is logged, not fatal.
+   */
+  private async preparePage(): Promise<void> {
+    const { cdp, platform, log, onPageReady } = this.deps;
+    await platform.installHeartbeatHook(cdp);
+    if (!onPageReady) return;
+    try {
+      await onPageReady();
+    } catch (err) {
+      log('warn', `timekeeper: lane page policy failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private resetPlaybackWatch(newVideo: boolean): void {
@@ -409,8 +484,8 @@ export class Timekeeper {
 
   /** Give up on one video: mark failed, resolve its watch, advance or stop. */
   private async abandonVideo(id: number, reason: string): Promise<TickOutcome> {
-    const { cdp, platform, log } = this.deps;
-    log('error', `timekeeper: video ${id} giving up — ${reason}. do NOT forge heartbeats.`);
+    const { cdp, log } = this.deps;
+    log('error', `timekeeper: video ${id} giving up — ${reason}`);
     this.gaveUp.add(id);
     this.queue = this.queue.filter((qid) => qid !== id);
     this.persist();
@@ -420,8 +495,8 @@ export class Timekeeper {
       this.stop();
       return { kind: 'idle', detail: 'queue drained (with failures)' };
     }
-    await cdp.navigate(videoUrl(next));
-    await platform.installHeartbeatHook(cdp);
+    await cdp.navigate(this.videoUrl(next));
+    await this.preparePage();
     this.resetPlaybackWatch(true);
     return { kind: 'abandon', id };
   }
@@ -461,12 +536,14 @@ export class Timekeeper {
       creditedDeltaSeconds:
         this.firstCredited !== null && this.lastCredited !== null ? this.lastCredited - this.firstCredited : null,
       recoveries: this.stallRecoveries,
+      rate: this.targetRate,
     };
     this.summary.push(outcome);
     this.deps.log(
       terminal.failed ? 'error' : 'info',
       `timekeeper: ${id} ${terminal.failed ? 'failed' : 'completed'} ` +
-        `credited=${outcome.creditedDeltaSeconds ?? '?'}/recovered=${outcome.recoveries}`,
+        `credited=${outcome.creditedDeltaSeconds ?? '?'}/recovered=${outcome.recoveries}` +
+        (this.targetRate === 1 ? '' : ` @${this.targetRate}x (wall ${outcome.wallSeconds}s)`),
     );
     const d = this.pending.get(id);
     if (d) {

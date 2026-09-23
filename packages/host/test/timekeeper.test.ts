@@ -213,11 +213,125 @@ describe('Timekeeper', () => {
     tk.stop();
   });
 
-  it('restores 1x playback when acceleration is detected', async () => {
+  it('restores the configured rate when the page drifts above it', async () => {
     const h = makeHarness({ rate: 4 });
     const tk = new Timekeeper(h.deps);
     await tk.tick();
     assert.ok(h.evals.some((e) => /playbackRate = 1/.test(e)));
+    tk.stop();
+  });
+
+  it('runs the lane onPageReady hook after every navigation (swarm seam)', async () => {
+    const h = makeHarness();
+    const hooks: string[] = [];
+    h.deps.onPageReady = async () => {
+      hooks.push('ready');
+    };
+    h.setUrl('https://lms.example.com/course/view.php?id=42');
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101, 102]);
+    await tk.tick(); // navigate to the first video
+    assert.deepEqual(hooks, ['ready']);
+    await tk.tick(); // already on a video page: no navigation, no hook
+    assert.deepEqual(hooks, ['ready']);
+    tk.stop();
+  });
+
+  it('logs but survives a failing lane policy', async () => {
+    const h = makeHarness();
+    h.deps.onPageReady = async () => {
+      throw new Error('Page.setWebLifecycleState unsupported');
+    };
+    h.setUrl('https://lms.example.com/course/view.php?id=42');
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101]);
+    const outcome = await tk.tick();
+    assert.deepEqual(outcome, { kind: 'navigate', id: 101 });
+    assert.ok(h.logs.some((l) => l.includes('lane page policy failed')));
+    tk.stop();
+  });
+
+  it('holds the page at the configured rate instead of resetting to 1x', async () => {
+    const h = makeHarness({ rate: 1 });
+    h.deps.rate = 2;
+    const tk = new Timekeeper(h.deps);
+    await tk.tick();
+    assert.ok(
+      h.evals.some((e) => /playbackRate = 2/.test(e)),
+      'a 1x page must be moved to the configured 2x, not left alone',
+    );
+    tk.stop();
+  });
+
+  it('undoes a page rate that differs from the configured one', async () => {
+    const h = makeHarness({ rate: 4 });
+    h.deps.rate = 2;
+    const tk = new Timekeeper(h.deps);
+    await tk.tick();
+    assert.ok(h.logs.some((l) => l.includes('4 ≠ configured 2')), h.logs.join('\n'));
+    assert.ok(h.evals.some((e) => /playbackRate = 2/.test(e)));
+    tk.stop();
+  });
+
+  it('runs the per-tick hook while playing and survives a failing one', async () => {
+    const h = makeHarness();
+    let ticks = 0;
+    h.deps.onTick = async () => {
+      ticks += 1;
+      if (ticks === 2) throw new Error('report replay exploded');
+    };
+    const tk = new Timekeeper(h.deps);
+    await tk.tick();
+    await tk.tick();
+    assert.equal(ticks, 2, 'the hook runs once per playing tick');
+    assert.ok(h.logs.some((l) => l.includes('tick hook failed')), h.logs.join('\n'));
+    tk.stop();
+  });
+
+  it('does not run the tick hook while the video is paused', async () => {
+    const h = makeHarness({ playing: false });
+    let ticks = 0;
+    h.deps.onTick = async () => {
+      ticks += 1;
+    };
+    const tk = new Timekeeper(h.deps);
+    await tk.tick();
+    assert.equal(ticks, 0);
+    tk.stop();
+  });
+
+  it('writes no rate at all when the run is at 1x', async () => {
+    const h = makeHarness({ rate: 1 });
+    const tk = new Timekeeper(h.deps);
+    await tk.tick();
+    assert.ok(!h.evals.some((e) => /playbackRate/.test(e)), 'no rate writes when nothing is configured');
+    tk.stop();
+  });
+
+  it('refuses to call a video finished on the client clock alone above 1x', async () => {
+    // The player raced to the end at 2x while the ledger is far behind.
+    const h = makeHarness({ playing: true, currentTime: 299, duration: 300, totaltime: 100, progress: 30 });
+    h.deps.rate = 2;
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101, 102]);
+    const first = await tk.tick();
+    assert.equal(first.kind, 'none', 'above 1x only the server may close a video out');
+
+    // Server catches up → now it really is finished and chains on.
+    h.setPlayer({ totaltime: 299, progress: 99 });
+    const second = await tk.tick();
+    assert.deepEqual(second, { kind: 'navigate', id: 102 });
+    const persisted = JSON.parse(readFileSync(h.deps.dataFile, 'utf8')) as { done: number[] };
+    assert.deepEqual(persisted.done, [101]);
+    tk.stop();
+  });
+
+  it('still crosses the line on the client clock at 1x', async () => {
+    const h = makeHarness({ playing: true, currentTime: 299, duration: 300, totaltime: null, progress: null });
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101, 102]);
+    const outcome = await tk.tick();
+    assert.deepEqual(outcome, { kind: 'navigate', id: 102 });
     tk.stop();
   });
 
@@ -241,16 +355,23 @@ describe('Timekeeper', () => {
     tk.stop();
   });
 
-  it('NEVER contains heartbeat-forging or acceleration code paths (source guard)', async () => {
+  it('keeps the rate and network invariants (source guard)', async () => {
     const { readFileSync: rf } = await import('node:fs');
     const tkSource = rf(new URL('../src/timekeeper.ts', import.meta.url), 'utf8');
     assert.ok(!/XMLHttpRequest|\.ajax\(|fetch\(/.test(tkSource), 'timekeeper must not issue HTTP requests');
-    const rateAssignments = tkSource.match(/playbackRate\s*=\s*[^;\s][^;]*/g) ?? [];
+    const rateAssignments = tkSource.match(/playbackRate\s*=\s*[^;]+/g) ?? [];
+    assert.ok(rateAssignments.length > 0, 'the rate guard must exist');
     for (const a of rateAssignments) {
-      assert.match(a, /=\s*1\s*$/, `timekeeper must never set playbackRate above 1: ${a.trim()}`);
+      // The host only ever writes the OPERATOR-configured rate. A hard-coded
+      // rate above 1 here would mean the host invented acceleration itself.
+      assert.match(a, /configured|targetRate|this\.rate/, `playbackRate must come from the configured value: ${a.trim()}`);
+      assert.ok(!/=\s*(?:[2-9]|\d\d)/.test(a), `timekeeper must never hard-code a rate above 1: ${a.trim()}`);
     }
     const solverish = rf(new URL('../src/quiz-loop.ts', import.meta.url), 'utf8');
     assert.ok(!/XMLHttpRequest|\.ajax\(|fetch\(/.test(solverish), 'quiz loop must not issue raw HTTP');
+    // Above 1x the client clock races the ledger: only the server's ack may
+    // close a video out.
+    assert.match(tkSource, /this\.targetRate > 1\.001 \? serverFinished/, 'finish detection must defer to the server above 1x');
   });
 });
 
