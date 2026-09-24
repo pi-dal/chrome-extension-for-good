@@ -287,7 +287,14 @@ export function clampProbeText(text: unknown): string {
 export async function detectConcurrencyWarning(cdp: LaneCdp): Promise<WarningProbe> {
   let text: string;
   try {
-    text = clampProbeText(await cdp.evaluate<unknown>('document.body ? document.body.textContent : ""'));
+    // Slice IN the page: this probe runs every poll interval on every lane, so
+    // serializing a whole body textContent over CDP just to truncate it here
+    // is wasted bandwidth on long pages.
+    text = clampProbeText(
+      await cdp.evaluate<unknown>(
+        `document.body ? String(document.body.textContent || '').slice(0, ${PROBE_TEXT_CAP}) : ""`,
+      ),
+    );
   } catch {
     return { hard: null, soft: null };
   }
@@ -523,7 +530,14 @@ export function startSwarm(deps: SwarmDeps): SwarmRun {
           log('info', `swarm: pass ${pass}/${maxPasses} — nothing left to watch, course complete`);
           break;
         }
-        const usable = runtimes.filter((rt) => alive.has(rt.lane.index)).slice(0, active);
+        // Dropped lanes (stopped by a degrade) are still in `alive` — they
+        // must NOT be selected: a dropped lane's runLane returns immediately,
+        // so picking one would idle every remaining pass with zero watches.
+        // When the designated survivor (lane 0) is itself dead, `usable` is
+        // empty and the run stops — the correct conservative outcome.
+        const usable = runtimes
+          .filter((rt) => alive.has(rt.lane.index) && !dropped.has(rt.lane.index))
+          .slice(0, active);
         if (usable.length === 0) {
           log('error', 'swarm: every lane died — stopping');
           break;
@@ -533,7 +547,9 @@ export function startSwarm(deps: SwarmDeps): SwarmRun {
         for (const rt of usable) {
           if (await checkLane(rt.lane.index)) break;
         }
-        const survivors = runtimes.filter((rt) => alive.has(rt.lane.index)).slice(0, active);
+        const survivors = runtimes
+          .filter((rt) => alive.has(rt.lane.index) && !dropped.has(rt.lane.index))
+          .slice(0, active);
         const slices = splitIntoLanes(fresh, survivors.length);
         log('info', `swarm: pass ${pass}/${maxPasses} — ${fresh.length} video(s) across ${survivors.length} lane(s): ${survivors.map((rt, i) => `${rt.lane.label}=[${slices[i]!.join(', ')}]`).join(' ')}`);
         const statuses = await Promise.all(survivors.map((rt, i) => runLane(rt, slices[i]!)));

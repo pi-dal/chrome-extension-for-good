@@ -94,20 +94,25 @@ export class JevArbitrator implements Arbitrator {
             return el ? `[${i}] ${el.role} "${el.name.slice(0, 40)}"` : `[${i}]`;
           })
           .join('\n');
-      const response = await this.client.systemOne({
-        state: {
-          dispute: dispute.summary,
-          heuristicGrouping: describe(dispute.heuristicIndices),
-          llmGrouping: describe(dispute.llmIndices),
+      const response = await this.client.systemOne(
+        {
+          state: {
+            dispute: dispute.summary,
+            heuristicGrouping: describe(dispute.heuristicIndices),
+            llmGrouping: describe(dispute.llmIndices),
+          },
+          questions: {
+            winner: choice('Which grouping of these elements is correct for the quiz structure?', {
+              heuristic: null,
+              llm: null,
+              neither: null,
+            }),
+          },
         },
-        questions: {
-          winner: choice('Which grouping of these elements is correct for the quiz structure?', {
-            heuristic: null,
-            llm: null,
-            neither: null,
-          }),
-        },
-      });
+        // A hung arbitration must degrade to 'unclassified', not stall the
+        // whole inspection (same bound as jev.ts decide()).
+        { timeout: 45_000 },
+      );
       const verdict = applyArbitrationVerdict(
         response.answers.winner.choice,
         response.answers.winner.confidence,

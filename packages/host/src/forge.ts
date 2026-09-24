@@ -68,7 +68,10 @@ export function replayScript(timeFieldPattern: string): string {
   try { re = new RegExp(${JSON.stringify(timeFieldPattern)}); } catch (e) { return { ok: false, status: null, detail: 'bad field pattern: ' + e }; }
   const m = re.exec(hb.requestBody);
   if (!m) return { ok: false, status: null, detail: 'position field not found in the recorded body: ' + String(hb.requestBody).slice(0, 160) };
-  const body = hb.requestBody.replace(re, m[0].replace(/\\d+(?:\\.\\d+)?/, String(pos)));
+  // Replace the LAST numeric run in the matched field text: the position value
+  // is the trailing number; a first-number replace would corrupt a field NAME
+  // that itself contains digits (custom patterns can declare e.g. "a1time").
+  const body = hb.requestBody.replace(re, m[0].replace(/(\\d+(?:\\.\\d+)?)(?!.*\\d)/, String(pos)));
   const json = /^\\s*[\\[{]/.test(body);
   try {
     const resp = await fetch(hb.url, {
@@ -129,18 +132,20 @@ export async function probeReportAcceptance(deps: ReportProbeDeps & { position: 
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
   const settleMs = deps.settleMs ?? 10_000;
   const before = await deps.platform.readPlayerState(deps.cdp).catch(() => null);
-  const replay = await replayReport(deps.cdp, deps.position, deps.forge);
-  deps.log('info', `report-probe: replayed position ${deps.position}s → ${replay.ok ? `HTTP ${replay.status}` : replay.detail}`);
+  // Judge observability BEFORE spending a report: a replay whose ack cannot
+  // be read teaches nothing and still lands on the server.
   if (!before || (before.totaltime === null && before.progress === null)) {
     return {
       verdict: 'unobservable',
       creditedDelta: null,
       progressDelta: null,
       position: deps.position,
-      replay,
+      replay: { ok: false, status: null, detail: 'not sent — no readable ack to judge against' },
       note: 'no readable server ack (totaltime/progress) — a forged report cannot be judged on this platform, so forging stays off',
     };
   }
+  const replay = await replayReport(deps.cdp, deps.position, deps.forge);
+  deps.log('info', `report-probe: replayed position ${deps.position}s → ${replay.ok ? `HTTP ${replay.status}` : replay.detail}`);
   await sleep(settleMs);
   const after = await deps.platform.readPlayerState(deps.cdp).catch(() => null);
   if (!after) {
@@ -156,7 +161,23 @@ export async function probeReportAcceptance(deps: ReportProbeDeps & { position: 
   const creditedDelta =
     before.totaltime !== null && after.totaltime !== null ? after.totaltime - before.totaltime : null;
   const progressDelta = before.progress !== null && after.progress !== null ? after.progress - before.progress : null;
-  const moved = (creditedDelta !== null && creditedDelta >= 0.5) || (progressDelta !== null && progressDelta >= 0.5);
+  // The video is PLAYING during the settle window, so the ack drifts upward
+  // naturally (~settle × rate seconds). A bare "did it move" check would call
+  // every ignored replay 'accepted'. The forged jump (position − currentTime)
+  // is the signal: require the delta to clearly exceed natural drift AND to
+  // cover a meaningful share of the jump (servers that cap per-report credit
+  // still count — +20s on a +60s forge is real credit, +10s is playback).
+  const rate = Math.max(1, before.rate || 1);
+  const jump = Math.max(0, deps.position - before.currentTime);
+  const driftBound = (settleMs / 1000) * rate * 1.5 + 2;
+  const threshold = Math.max(driftBound, Math.min(jump * 0.5, 20));
+  const creditedMoved = creditedDelta !== null && creditedDelta > threshold;
+  // Progress is a percentage: convert the seconds bound via duration when
+  // known; without a duration the progress signal alone cannot be judged.
+  const progressBound = before.duration > 0 ? (threshold / before.duration) * 100 : null;
+  const progressMoved =
+    progressDelta !== null && progressBound !== null && progressDelta > progressBound;
+  const moved = creditedMoved || progressMoved;
   if (moved) {
     return {
       verdict: 'accepted',
@@ -164,7 +185,7 @@ export async function probeReportAcceptance(deps: ReportProbeDeps & { position: 
       progressDelta,
       position: deps.position,
       replay,
-      note: `the backend credited the replayed position (+${(creditedDelta ?? progressDelta ?? 0).toFixed(1)}) — report replay works here`,
+      note: `the backend credited the replayed position (+${(creditedDelta ?? progressDelta ?? 0).toFixed(1)} beyond the ~${threshold.toFixed(0)}s natural-drift bound) — report replay works here`,
     };
   }
   if (!replay.ok) {
@@ -184,7 +205,7 @@ export async function probeReportAcceptance(deps: ReportProbeDeps & { position: 
     position: deps.position,
     replay,
     note:
-      'the replay was accepted by HTTP but the ack did not move — this backend caps credit against real wall-clock, so forged positions buy nothing',
+      `the replay was accepted by HTTP but the ack moved no more than natural playback explains (≤${threshold.toFixed(0)}s) — this backend caps credit against real wall-clock, so forged positions buy nothing`,
   };
 }
 
@@ -245,6 +266,19 @@ export class ReportProbeStore {
 
   get(origin: string): ReportProbeEntry | undefined {
     return this.entries.get(origin);
+  }
+
+  /**
+   * Entry younger than `maxAgeMs` (default 30 days). A stale 'accepted' must
+   * not arm replay forever — backends change — and a stale 'ignored' should
+   * not ban it forever either; both expire back to 'no-evidence'.
+   */
+  getFresh(origin: string, maxAgeMs = 30 * 24 * 3_600_000, now = Date.now()): ReportProbeEntry | undefined {
+    const entry = this.entries.get(origin);
+    if (!entry) return undefined;
+    const measured = Date.parse(entry.at);
+    if (!Number.isFinite(measured) || now - measured > maxAgeMs) return undefined;
+    return entry;
   }
 
   record(entry: ReportProbeEntry): void {
@@ -359,10 +393,17 @@ export function makeForgeDriver(deps: ForgeDriverDeps): ForgeDriver {
         return;
       }
       // Compare the ack before/after THIS report: priming from a stale value
-      // would score the first honest report as a stall.
-      const beforeAck = state.totaltime ?? state.progress ?? null;
+      // would score the first honest report as a stall. The ack field must be
+      // the SAME on both reads — totaltime is seconds, progress is percent.
+      const ackField: 'totaltime' | 'progress' | null =
+        state.totaltime !== null ? 'totaltime' : state.progress !== null ? 'progress' : null;
+      const beforeAck = ackField === null ? null : state[ackField];
       const target = deps.toEnd && state.duration > 0 ? state.duration : state.currentTime + step;
       const position = Math.max(1, Math.round(target));
+      // Nothing to claim: the playhead already reached the forged position
+      // (toEnd near the end of the video). Reporting a position at/behind the
+      // playhead is meaningless and could regress the server-side ledger.
+      if (position <= state.currentTime + 1) return;
       const replay = await replayReport(deps.cdp, position, deps.forge);
       reports += 1;
       if (!replay.ok) {
@@ -370,8 +411,23 @@ export function makeForgeDriver(deps: ForgeDriverDeps): ForgeDriver {
         deps.log('warn', `forge: report ${reports} refused (${replay.detail.slice(0, 120)}) — stall ${stalls}/${maxStalls}`);
       } else {
         const after = await deps.platform.readPlayerState(deps.cdp).catch(() => null);
-        const afterAck = after?.totaltime ?? after?.progress ?? null;
-        const moved = beforeAck !== null && afterAck !== null ? afterAck > beforeAck : null;
+        const afterAck = after !== null && ackField !== null ? after[ackField] : null;
+        // A bare `>` is not enough: a NATURAL heartbeat landing between the
+        // two reads credits ~one heartbeat interval and would masquerade as
+        // acceptance — the driver would never stall out on a backend that
+        // ignores forging but heartbeats often. Require the ack to cover a
+        // meaningful share of the forged jump (capped, so partial-credit
+        // backends still count). Progress acks are percent — convert via
+        // duration.
+        const forgedJump = Math.max(0, position - state.currentTime);
+        // Floor of 5s: a natural heartbeat ack landing between the two reads
+        // credits its inter-report gap — a bound of 0 (jump≈0) or a bare
+        // positive would score that as acceptance and never stall out.
+        const boundSec = Math.max(5, Math.min(forgedJump * 0.5, 20));
+        const acceptBound =
+          ackField === 'progress' && state.duration > 0 ? (boundSec / state.duration) * 100 : boundSec;
+        const moved =
+          beforeAck !== null && afterAck !== null ? afterAck - beforeAck >= acceptBound : null;
         if (moved === true) {
           accepted += 1;
           stalls = 0;

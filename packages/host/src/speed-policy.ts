@@ -139,6 +139,11 @@ export function decideRate(opts: {
     };
   }
   const headline = `measured ${entry.measuredAt.slice(0, 16)}: ${entry.note}`;
+  // The evidence covers the rate it was measured at — honouring a HIGHER
+  // request is an extrapolation the operator should see, not a silent upgrade.
+  if (requested > entry.requestedRate * 1.001) {
+    log('warn', `rate: requested ${requested}x exceeds the measured ${entry.requestedRate}x — the evidence may not extend to this rate`);
+  }
   if (entry.verdict === 'credited') {
     log('info', `rate: ${requested}x enabled — ${headline}`);
     return { rate: requested, verdict: entry.verdict, allowed: true, note: `credited ≈ ${fmtX(entry.creditedSpeed)} wall clock; ${headline}` };

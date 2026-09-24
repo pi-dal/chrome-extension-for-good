@@ -539,6 +539,48 @@ describe('startSwarm', () => {
     }
   });
 
+  it('stops cleanly when a degrade fires and the designated survivor (lane0) is already dead', async () => {
+    // Regression: `usable`/`survivors` used to filter only on `alive`, so a
+    // lane dropped by degrade() could be selected — its runLane returns
+    // immediately on the dropped check, and every remaining pass idled with
+    // zero watches until maxPasses. The dropped set must be excluded too.
+    const l = logs();
+    const { ledger, failed } = makeLedgers('degrade-dead');
+    const lanes = [fakeLane(0, { throwOn: 1 }), fakeLane(1)];
+    let probes = 0;
+    const run = startSwarm({
+      lanes: lanes.map((f) => f.lane),
+      courseUrl: 'https://lms.example.com/course/view.php?id=42',
+      scrape: scriptedScrape([[item(1), item(2), item(3)], [item(1), item(2), item(3)], [item(1), item(2), item(3)]]),
+      ledger,
+      failed,
+      log: l.log,
+      flagFile: join(tmp, 'swarm-flag-degrade-dead.json'),
+      makeSupervisor: (lane) => lanes[lane.index]!.sup,
+      warningPollMs: 0,
+      // First pass-start probe (lane0) is clean; the second (lane1) trips the
+      // warning → degrade keeps lane0, drops lane1 — then lane0 dies on its
+      // first video, leaving no usable lane at all.
+      probeWarning: async () => {
+        probes += 1;
+        return probes >= 2 ? { hard: '禁止同时观看多个视频', soft: null } : { hard: null, soft: null };
+      },
+    });
+    const summary = await run.done;
+
+    assert.equal(summary.flagged?.laneIndex, 1);
+    assert.deepEqual(lanes[0]!.calls, [1], 'lane0 died on its first video');
+    assert.deepEqual(lanes[1]!.calls, [], 'the dropped lane must never be handed work');
+    assert.equal(lanes[1]!.stopCount(), 1, 'degrade stood the lane down');
+    assert.ok(
+      l.lines.some((line) => line.includes('every lane died')),
+      `the run must stop loudly instead of idling for maxPasses; logs:\n${l.lines.join('\n')}`,
+    );
+    assert.equal(summary.completed, 0);
+    assert.equal(ledger.all().length, 0);
+    assert.equal(failed.all().length, 0, 'a thrown watch is not an attempt');
+  });
+
   it('stop() ends the run without charging interrupted videos against the retry cap', async () => {
     const l = logs();
     const { ledger, failed } = makeLedgers('stop');

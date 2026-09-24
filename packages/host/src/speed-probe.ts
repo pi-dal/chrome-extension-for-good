@@ -97,12 +97,16 @@ export function creditSlopes(samples: CreditSample[]): {
   const last = withHeartbeat[withHeartbeat.length - 1];
   const distinct = new Set(withHeartbeat.map((s) => s.heartbeatTs)).size;
   const wallSpan = first && last ? (last.heartbeatTs - first.heartbeatTs) / 1000 : 0;
+  // A slope over a tiny heartbeat span is noise, not signal: two responses
+  // 0.5s apart with 10s of credit between them would read as 20x wall clock.
+  // Below MIN_SLOPE_SPAN_S the phase is unobservable rather than misleading.
+  const usableSpan = wallSpan >= MIN_SLOPE_SPAN_S;
   const creditedPerWall =
-    first && last && wallSpan > 0 && first.credited !== null && last.credited !== null
+    first && last && usableSpan && first.credited !== null && last.credited !== null
       ? (last.credited - first.credited) / wallSpan
       : null;
   const progressPerWall =
-    first && last && wallSpan > 0 && first.progress !== null && last.progress !== null
+    first && last && usableSpan && first.progress !== null && last.progress !== null
       ? (last.progress - first.progress) / wallSpan
       : null;
   const videoFirst = samples[0];
@@ -126,6 +130,10 @@ export function creditSignal(phase: Pick<PhaseMeasurement, 'creditedPerWall' | '
 export const CREDITED_FRACTION = 0.9;
 export const WALLCLOCK_CEILING = 1.2;
 export const MIN_BASELINE_SPEED = 0.5;
+/** Heartbeat span below this many seconds cannot carry a slope (burst noise). */
+export const MIN_SLOPE_SPAN_S = 3;
+/** The page must hold at least this fraction of the requested rate. */
+export const MIN_OBSERVED_RATE_FRACTION = 0.8;
 
 export function computeVerdict(
   base: PhaseMeasurement,
@@ -164,6 +172,17 @@ export function computeVerdict(
       creditRatio: null,
       creditedSpeed: fastSpeed,
       note: `baseline 1x credit is only ${baseSpeed.toFixed(2)}x wall clock — investigate the stall before judging any playback rate`,
+    };
+  }
+  // The verdict judges the BACKEND — but only if the page actually ran at
+  // the requested rate. A player that clamps/resets playbackRate produces a
+  // 1x fast phase whose ~1.0 ratio would masquerade as 'wallclock'.
+  if (fast.observedRate < requestedRate * MIN_OBSERVED_RATE_FRACTION) {
+    return {
+      verdict: 'unobservable',
+      creditRatio: null,
+      creditedSpeed: fastSpeed,
+      note: `the page never held the requested rate (observed ${fast.observedRate.toFixed(2)}x of ${requestedRate}x) — the player refused, so nothing about the backend was measured`,
     };
   }
   const ratio = fastSpeed / baseSpeed;

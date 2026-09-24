@@ -67,6 +67,22 @@ test('parseElementTable validates deeply', () => {
   assert.throws(() => parseElementTable({ ...table, capturedAt: 'now' }), Error);
 });
 
+test('parseElementTable round-trips htmlName (F8 grouping signal)', () => {
+  const withName: ElementTable = {
+    ...table,
+    elements: [
+      { index: 1, role: 'radio', name: 'A', tag: 'input', htmlName: 'q1', rect: { x: 0, y: 0, w: 8, h: 8 } },
+      { index: 2, role: 'radio', name: 'B', tag: 'input', htmlName: 'q1', rect: { x: 0, y: 10, w: 8, h: 8 } },
+    ],
+  };
+  const parsed = roundTrip(parseElementTable, withName);
+  assert.equal(parsed.elements[0].htmlName, 'q1');
+  assert.throws(
+    () => parseElementTable({ ...withName, elements: [{ ...withName.elements[0], htmlName: 42 }] }),
+    Error,
+  );
+});
+
 test('ExtToHost: hello round-trip and narrowing', () => {
   const msg: ExtToHost = {
     type: 'hello',

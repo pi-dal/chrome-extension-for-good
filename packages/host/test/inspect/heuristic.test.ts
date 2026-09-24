@@ -82,6 +82,122 @@ describe('heuristicGroup: structural path (tricky)', () => {
   });
 });
 
+describe('heuristicGroup: htmlName splitting (F8)', () => {
+  const el = (
+    index: number,
+    role: string,
+    name: string,
+    htmlName?: string,
+    checked?: boolean,
+  ) => ({
+    index,
+    role,
+    name,
+    tag: 'input',
+    rect: { x: 0, y: index * 10, w: 8, h: 8 },
+    ...(htmlName !== undefined ? { htmlName } : {}),
+    ...(checked !== undefined ? { checked } : {}),
+  });
+  const text = (index: number, name: string) => ({
+    index,
+    role: 'text',
+    name,
+    tag: 'div',
+    rect: { x: 0, y: index * 10, w: 80, h: 8 },
+  });
+
+  it('splits a contiguous radio run when the DOM name changes', () => {
+    // Two questions whose second stem was never captured (plain <p> outside
+    // the interactive selector): the radios are contiguous in the table but
+    // carry different names — they must NOT merge into one group.
+    const table = {
+      url: 'https://x.test/',
+      title: 't',
+      capturedAt: 1,
+      elements: [
+        text(1, '1. 下列哪项正确？'),
+        el(2, 'radio', 'A', 'q1'),
+        el(3, 'radio', 'B', 'q1'),
+        el(4, 'radio', 'A', 'q2'),
+        el(5, 'radio', 'B', 'q2'),
+      ],
+    } as const;
+    const result = heuristicGroup(table as unknown as Parameters<typeof heuristicGroup>[0]);
+    assert.deepEqual(
+      result.questions.map((q) => [q.stemIndex, q.optionIndices]),
+      [[1, [2, 3]]],
+    );
+    // The split-off run has no captured stem → unassigned for the
+    // conservation auditor / LLM feedback, never silently merged.
+    assert.deepEqual(result.unassigned, [4, 5]);
+  });
+
+  it('keeps same-name contiguous radios in one group', () => {
+    const table = {
+      url: 'https://x.test/',
+      title: 't',
+      capturedAt: 1,
+      elements: [
+        text(1, '1. 下列哪项正确？'),
+        el(2, 'radio', 'A', 'q1'),
+        el(3, 'radio', 'B', 'q1'),
+        el(4, 'radio', 'C', 'q1'),
+      ],
+    } as const;
+    const result = heuristicGroup(table as unknown as Parameters<typeof heuristicGroup>[0]);
+    assert.deepEqual(
+      result.questions.map((q) => [q.stemIndex, q.optionIndices]),
+      [[1, [2, 3, 4]]],
+    );
+    assert.deepEqual(result.unassigned, []);
+  });
+
+  it('splits a radio run followed by a checkbox run (role change)', () => {
+    const table = {
+      url: 'https://x.test/',
+      title: 't',
+      capturedAt: 1,
+      elements: [
+        text(1, '1. 单选题：'),
+        el(2, 'radio', 'A', 'q1'),
+        el(3, 'radio', 'B', 'q1'),
+        text(4, '2. 多选题：'),
+        el(5, 'checkbox', '甲', 'q2a'),
+        el(6, 'checkbox', '乙', 'q2b'),
+      ],
+    } as const;
+    const result = heuristicGroup(table as unknown as Parameters<typeof heuristicGroup>[0]);
+    assert.deepEqual(
+      result.questions.map((q) => [q.stemIndex, q.optionIndices]),
+      [
+        [1, [2, 3]],
+        [4, [5, 6]],
+      ],
+    );
+  });
+});
+
+describe('heuristicGroup: answered detection (H3)', () => {
+  it('a partially-checked multi-select counts as answered', () => {
+    const table = {
+      url: 'https://x.test/',
+      title: 't',
+      capturedAt: 1,
+      elements: [
+        { index: 1, role: 'text', name: '1. 选出所有偶数', tag: 'div', rect: { x: 0, y: 0, w: 80, h: 8 } },
+        { index: 2, role: 'checkbox', name: '一', tag: 'input', rect: { x: 0, y: 10, w: 8, h: 8 } },
+        { index: 3, role: 'checkbox', name: '二', tag: 'input', checked: true, rect: { x: 0, y: 20, w: 8, h: 8 } },
+        { index: 4, role: 'checkbox', name: '三', tag: 'input', rect: { x: 0, y: 30, w: 8, h: 8 } },
+      ],
+    } as const;
+    const result = heuristicGroup(table as unknown as Parameters<typeof heuristicGroup>[0]);
+    assert.equal(result.questions.length, 1);
+    // A proper-subset selection IS an answer on the platform — treating it
+    // as unanswered would toggle the correct selection back off on retry.
+    assert.equal(result.questions[0]!.answered, true);
+  });
+});
+
 describe('heuristicGroup: conservative failures', () => {
   it('leaves stem-less option runs unassigned instead of guessing', () => {
     const table = {

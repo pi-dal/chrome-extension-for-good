@@ -54,19 +54,31 @@ export async function applyQuizScope(
     const indices = capture.table.elements.map((el) => el.index);
     const flags = await deps.evalJson(buildMembershipProbeExpression(safe, indices));
     const inside = new Set<number>();
-    if (Array.isArray(flags)) {
+    if (Array.isArray(flags) && flags.length === indices.length) {
       flags.forEach((flag, i) => {
         if (flag === 1) inside.add(indices[i]!);
       });
+    } else if (Array.isArray(flags)) {
+      // A truncated probe must not silently crop the tail of the table.
+      applied.scopeNote = `quiz.rootSelector probe returned ${flags.length}/${indices.length} flags — keeping the full page`;
+      deps.log('warn', `inspect hints: ${applied.scopeNote}`);
+      return { capture, applied };
     }
     if (inside.size === 0) {
       applied.scopeNote = `quiz.rootSelector ${safe} matched no snapshot element — keeping the full page`;
       deps.log('warn', `inspect hints: ${applied.scopeNote}`);
       return { capture, applied };
     }
-    const kept = capture.table.elements.filter((el) => inside.has(el.index));
+    // Nav candidates (buttons/links) are kept even when they sit OUTSIDE the
+    // scoped root: submit/save/next bars commonly live in a sibling container
+    // (Moodle .submitbtns), and dropping them would silently kill pagination
+    // and the submit gate — navName/navEnabled resolve against this table.
+    const kept = capture.table.elements.filter((el) => inside.has(el.index) || isNavCandidate(el));
+    const navKeptOutside = kept.filter((el) => !inside.has(el.index)).length;
     applied.scoped = true;
-    applied.scopeNote = `scoped to ${safe}: kept ${kept.length}/${capture.table.elements.length} elements`;
+    applied.scopeNote =
+      `scoped to ${safe}: kept ${kept.length}/${capture.table.elements.length} elements` +
+      (navKeptOutside > 0 ? ` (${navKeptOutside} nav candidate(s) outside scope retained)` : '');
     applied.diagnostics.push(applied.scopeNote);
     deps.log('info', `inspect hints: ${applied.scopeNote}`);
     return { capture: { ...capture, table: { ...capture.table, elements: kept } }, applied };
@@ -93,6 +105,11 @@ export function navIndicesFromLabels(table: ElementTable, labels: string[]): num
 
 function normalize(text: string): string {
   return text.replace(/\s+/g, '').toLowerCase();
+}
+
+/** Mirror of heuristic.isButtonish — kept local so hints stay self-contained. */
+function isNavCandidate(el: ElementInfo): boolean {
+  return el.role === 'button' || el.role === 'link' || el.tag === 'button';
 }
 
 /**
@@ -145,11 +162,15 @@ export async function readProgressHint(
     );
     if (typeof raw !== 'string' || raw.trim() === '') return null;
     const nums = (raw.match(/\d+(?:\.\d+)?/g) ?? []).map(Number).filter((n) => Number.isFinite(n));
-    if (nums.length === 0) return null;
-    // "已完成 37.5%" style widgets: one number is a percentage of the whole
+    // An x/y claim needs BOTH numbers: a single number is ambiguous (a
+    // percentage like "已完成 37.5%" would become a bogus 37.5/100 claim and
+    // over-trigger the progress-conservation hunt). And x must not exceed y:
+    // "12 题已完成 3" yields [12,3] — an inverted claim is worse than none.
+    if (nums.length < 2) return null;
     const first = nums[0]!;
-    const second = nums.length > 1 ? nums[1]! : 100;
-    return { raw: raw.trim(), current: first, total: second === 0 ? 100 : second };
+    const second = nums[1]!;
+    if (first < 1 || second < first) return null;
+    return { raw: raw.trim(), current: first, total: second };
   } catch {
     return null;
   }

@@ -25,6 +25,12 @@ export interface ElementInfo {
   rect: Rect;
   framePath?: string;
   quizSlot?: 'question' | 'option' | 'answer-input' | 'nav';
+  /**
+   * The element's DOM `name` attribute (radio inputs sharing a name are one
+   * question). Carried since the F8 fix — structural grouping uses it to
+   * split contiguous radio runs that belong to different questions.
+   */
+  htmlName?: string;
 }
 
 export interface ElementTable {
@@ -72,6 +78,10 @@ export interface SitePluginMatch {
   course?: string;
   /** Additional course-page substrings. */
   courseAny?: string[];
+  /** Optional substring identifying a quiz/attempt page (enables quiz hints). */
+  quiz?: string;
+  /** Additional quiz-page substrings. */
+  quizAny?: string[];
 }
 
 export interface SitePlugin {
@@ -180,6 +190,12 @@ export type HostToExt =
       tabId: number;
       quizOnly?: boolean;
       includePageText?: boolean;
+      /**
+       * Keep elements whose center is outside the viewport. Captures need the
+       * whole page (a multi-screen quiz must pass progress conservation);
+       * the default viewport crop only exists to keep resume-path tables small.
+       */
+      includeOffscreen?: boolean;
     }
   | { type: 'action_request'; requestId: string; tabId: number; action: Action }
   /** Swarm lane provisioning: open a tab and report its chrome.tabs id. */
@@ -278,6 +294,10 @@ export function parseElementInfo(raw: unknown): ElementInfo {
     }
     el.quizSlot = raw.quizSlot as ElementInfo['quizSlot'];
   }
+  if (raw.htmlName !== undefined) {
+    if (!isStr(raw.htmlName)) throw new Error('invalid ElementInfo.htmlName');
+    el.htmlName = raw.htmlName;
+  }
   return el;
 }
 
@@ -297,27 +317,31 @@ export function parseElementTable(raw: unknown): ElementTable {
 
 export function parseAction(raw: unknown): Action {
   if (!isRecord(raw) || !isStr(raw.op)) throw new Error('invalid Action: missing op');
+  // Size bounds: action payloads are partly model-influenced (solver text) and
+  // travel the ws bridge — cap them so a pathological answer cannot smuggle a
+  // megabyte into a type/eval op.
+  const bounded = (v: unknown, label: string, max: number): string => {
+    if (!isStr(v)) throw new Error(`invalid ${label}`);
+    if (v.length > max) throw new Error(`invalid ${label}: exceeds ${max} chars`);
+    return v;
+  };
   switch (raw.op) {
     case 'click':
       if (!isNum(raw.index)) throw new Error('invalid click Action.index');
       return { op: 'click', index: raw.index };
     case 'type':
       if (!isNum(raw.index)) throw new Error('invalid type Action.index');
-      if (!isStr(raw.text)) throw new Error('invalid type Action.text');
-      return { op: 'type', index: raw.index, text: raw.text };
+      return { op: 'type', index: raw.index, text: bounded(raw.text, 'type Action.text', 4096) };
     case 'select':
       if (!isNum(raw.index)) throw new Error('invalid select Action.index');
-      if (!isStr(raw.option)) throw new Error('invalid select Action.option');
-      return { op: 'select', index: raw.index, option: raw.option };
+      return { op: 'select', index: raw.index, option: bounded(raw.option, 'select Action.option', 512) };
     case 'scroll':
       if (!isNum(raw.deltaY)) throw new Error('invalid scroll Action.deltaY');
       return { op: 'scroll', deltaY: raw.deltaY };
     case 'key':
-      if (!isStr(raw.key)) throw new Error('invalid key Action.key');
-      return { op: 'key', key: raw.key };
+      return { op: 'key', key: bounded(raw.key, 'key Action.key', 64) };
     case 'eval':
-      if (!isStr(raw.expression)) throw new Error('invalid eval Action.expression');
-      return { op: 'eval', expression: raw.expression };
+      return { op: 'eval', expression: bounded(raw.expression, 'eval Action.expression', 8192) };
     default:
       throw new Error(`invalid Action.op: ${JSON.stringify(raw.op)}`);
   }
@@ -474,12 +498,16 @@ export function parseHostToExt(raw: unknown): HostToExt {
       if (raw.includePageText !== undefined && typeof raw.includePageText !== 'boolean') {
         throw new Error('invalid snapshot_request.includePageText');
       }
+      if (raw.includeOffscreen !== undefined && typeof raw.includeOffscreen !== 'boolean') {
+        throw new Error('invalid snapshot_request.includeOffscreen');
+      }
       return {
         type: 'snapshot_request',
         requestId: raw.requestId,
         tabId: raw.tabId,
         ...(raw.quizOnly !== undefined ? { quizOnly: raw.quizOnly } : {}),
         ...(raw.includePageText !== undefined ? { includePageText: raw.includePageText } : {}),
+        ...(raw.includeOffscreen !== undefined ? { includeOffscreen: raw.includeOffscreen } : {}),
       };
     }
     case 'action_request': {
@@ -541,7 +569,7 @@ export function parseSitePlugin(raw: unknown): SitePlugin {
   const match: SitePluginMatch = {
     video: boundedText(raw.match.video, 'SitePlugin.match.video', 256),
   };
-  for (const key of ['videoAny', 'courseAny'] as const) {
+  for (const key of ['videoAny', 'courseAny', 'quizAny'] as const) {
     const value = raw.match[key];
     if (value === undefined) continue;
     if (!Array.isArray(value) || value.length === 0) {
@@ -554,6 +582,9 @@ export function parseSitePlugin(raw: unknown): SitePlugin {
   }
   if (raw.match.course !== undefined) {
     match.course = boundedText(raw.match.course, 'SitePlugin.match.course', 256);
+  }
+  if (raw.match.quiz !== undefined) {
+    match.quiz = boundedText(raw.match.quiz, 'SitePlugin.match.quiz', 256);
   }
   const plugin: SitePlugin = {
     id,

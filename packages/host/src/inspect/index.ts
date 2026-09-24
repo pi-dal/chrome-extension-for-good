@@ -76,14 +76,17 @@ function assignedOf(state: GroupingState): number[] {
 
 function answeredFromTable(table: ElementTable, stemIndex: number, optionIndices: number[], inputIndices: number[]): boolean {
   if (optionIndices.length > 0) {
-    // Role-aware (see heuristic.ts isAnswered): radios = some, checkboxes = all.
+    // Role-aware (see heuristic.ts isAnswered): radios and checkboxes alike
+    // count as answered once ANY option is selected — a proper-subset
+    // multi-select answer is answered, and treating it as unanswered would
+    // toggle the correct selections back off on retry (review H3).
     const options = optionIndices
       .map((idx) => elementAt(table, idx))
       .filter((el): el is ElementInfo => el !== undefined);
     const radios = options.filter((el) => el.role === 'radio');
     const checkboxes = options.filter((el) => el.role === 'checkbox');
     const radiosOk = radios.length === 0 || radios.some((el) => el.checked === true);
-    const boxesOk = checkboxes.length === 0 || checkboxes.every((el) => el.checked === true);
+    const boxesOk = checkboxes.length === 0 || checkboxes.some((el) => el.checked === true);
     return radiosOk && boxesOk;
   }
   if (inputIndices.length > 0) {
@@ -128,6 +131,9 @@ async function applyEnumeration(
       if (verdict.winner === 'llm') {
         hq.optionIndices = [...eq.optionIndices];
         hq.inputIndices = [...eq.inputIndices];
+        // The option set changed — recompute answered against the NEW indices
+        // (the flag was computed on the heuristic grouping's set).
+        hq.answered = answeredFromTable(table, hq.stemIndex, hq.optionIndices, hq.inputIndices);
         hq.source = 'arbitrated';
         hq.confidence = Math.max(0.5, verdict.confidence);
         diagnostics.push(`arbitration: llm grouping adopted for stem #${eq.stemIndex} (${verdict.confidence.toFixed(2)})`);

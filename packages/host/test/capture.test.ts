@@ -276,7 +276,21 @@ describe('wsCaptureTransport adapter', () => {
       calls.map((c) => c.method),
       ['snapshot', 'act'],
     );
-    assert.deepEqual(calls[0].args, [42, { includePageText: true }]);
+    assert.deepEqual(calls[0].args, [42, { includePageText: true, includeOffscreen: false }]);
+  });
+
+  it('forwards includeOffscreen so captures cover the whole page', async () => {
+    const seen: unknown[] = [];
+    const fakeWs = {
+      snapshot: async (_tabId: number, opts?: { includeOffscreen?: boolean }) => {
+        seen.push(opts?.includeOffscreen);
+        return { table: table([el(1, 'radio', 'a')]) };
+      },
+      act: async () => ({ ok: true, url: 'https://exam.example.com/quiz/1' }),
+    };
+    const transport = wsCaptureTransport(fakeWs, 42);
+    await transport.snapshot({ includeOffscreen: true });
+    assert.deepEqual(seen, [true], 'a capture asking for the full page must reach the bridge');
   });
 });
 

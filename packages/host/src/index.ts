@@ -69,7 +69,7 @@ Usage:
   tsx src/index.ts watch   [--url SUBSTR] [--queue 1,2,3]
   tsx src/index.ts quiz    [--url SUBSTR]
   tsx src/index.ts chain   <courseUrl> [--queue 1,2,3] [--loop] [--max-passes N]
-  tsx src/index.ts chain   <courseUrl> --swarm N [--swarm-mute] [--swarm-keep-tabs]
+  tsx src/index.ts chain   <courseUrl> --loop --swarm N [--swarm-mute] [--swarm-keep-tabs]
   tsx src/index.ts speed-probe [--url SUBSTR] [--rate R] [--window SECONDS] [--keep-rate]
   tsx src/index.ts report-probe [--url SUBSTR] [--to-end] [--position SECONDS]
   tsx src/index.ts inspect [--url SUBSTR | --from FILE] [--learn]
@@ -185,8 +185,18 @@ if (config.autoSubmit) {
 
 function pickTabId(urlSubstring: string | undefined): number {
   const tabs = bridge.tabs.filter((t) => t.url.startsWith('http'));
-  const match = urlSubstring ? tabs.find((t) => t.url.includes(urlSubstring)) : undefined;
-  const tab = match ?? tabs[0];
+  if (urlSubstring) {
+    const match = tabs.find((t) => t.url.includes(urlSubstring));
+    if (!match) {
+      throw new Error(
+        `--url "${urlSubstring}" matched no open tab — refusing to drive an arbitrary tab. ` +
+          `Open tabs: ${tabs.map((t) => t.url.slice(0, 60)).join(' | ') || '(none)'}`,
+      );
+    }
+    log('info', `picked tab ${match.id}: ${match.title.slice(0, 60)} — ${match.url.slice(0, 80)}`);
+    return match.id;
+  }
+  const tab = tabs[0];
   if (!tab) throw new Error('no eligible tab found in the extension hello payload');
   log('info', `picked tab ${tab.id}: ${tab.title.slice(0, 60)} — ${tab.url.slice(0, 80)}`);
   return tab.id;
@@ -329,13 +339,21 @@ function toPolicyEntry(origin: string, result: SpeedProbeResult): SpeedPolicyEnt
   };
 }
 
-/** A video URL built against whatever origin the tab is currently on. */
+/**
+ * Absolute video URL for a resource id, built from the resolved site plugin's
+ * `videoUrlTemplate` (falling back to the built-in LMS shape when no adapter
+ * was resolved yet) against the tab's current origin.
+ */
 async function videoUrlFor(cdp: { url(): Promise<string> }, id: number): Promise<string> {
   const current = await cdp.url().catch(() => '');
+  // Prefer the plugin that owns the CURRENT page (video or course matcher);
+  // fall back to the last-resolved adapter / built-in LMS template.
+  const adapter = registry.forUrl(current) ?? registry.forCourseUrl(current);
+  const template = adapter?.videoUrl(id) ?? platform.videoUrl(id);
   try {
-    return new URL(`/mod/fsresource/view.php?id=${id}`, current || 'https://localhost').toString();
+    return new URL(template, current || 'https://localhost').toString();
   } catch {
-    return `/mod/fsresource/view.php?id=${id}`;
+    return template;
   }
 }
 
@@ -485,7 +503,9 @@ function resolveForge(args: CliArgs, adapter: PlatformAdapter | null, origin: st
   const decision = decideForge({
     requested: args.forge ?? false,
     hasPattern: adapter?.plugin.forge?.timeFieldPattern !== undefined || adapter?.plugin.forge?.replayJs !== undefined,
-    entry: store.get(origin),
+    // Fresh only: a stale 'accepted' must not arm replay forever (backends
+    // change), and a stale 'ignored' should not ban it forever either.
+    entry: store.getFresh(origin),
     force: args.forgeForce ?? false,
     log,
   });
@@ -589,10 +609,16 @@ async function resolveRunRate(
 
 /**
  * chain --loop: overnight batch supervisor. Passes = course rescrape + ledger
- * diff; each video runs to a terminal WatchOutcome under real 1x playback.
+ * diff; each video runs to a terminal WatchOutcome under real playback.
  * Completions land in data/completions.json, retry counts in data/failed.json
  * (exhausted videos are skipped by later passes). No queue item is ever
  * started twice within a run.
+ *
+ * --rate / --forge are measured user choices and gate here exactly like the
+ * single-shot watch/chain path and the swarm path (docs/m4, docs/m5 §6):
+ * the rate resolves once for the whole run (inline probe on the first scraped
+ * video when no fresh policy exists), and the forge driver arms lazily on the
+ * first tick that lands on a video page.
  */
 async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: number; cdp: CdpTab }): Promise<void> {
   const dataDir = defaultDataDir();
@@ -609,9 +635,28 @@ async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: num
     return ids.map((id) => ({ url: platform.videoUrl(id), resourceId: id }));
   };
 
+  // Probe candidate for the rate gate: the first video the course page lists.
+  // The tab is already on the course page (main() navigated it here).
+  let queueHead: number | null = null;
+  try {
+    const ids = await platform.scrapeCourseVideoIds(live.cdp);
+    queueHead = ids[0] ?? null;
+  } catch (err) {
+    log('debug', `chain --loop: couldn't scrape a probe candidate: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const rate = (await resolveRunRate(args, { cdp: live.cdp }, queueHead)).rate;
+
+  // Forge gate: the tab sits on the COURSE page here, so the video matcher
+  // (forUrl) would miss — resolve through the course matcher like the swarm
+  // path does.
+  const loopOrigin = originOf(courseUrl);
+  const loopForge = resolveForge(args, registry.forCourseUrl(courseUrl) ?? registry.forUrl(courseUrl), loopOrigin);
+  const forgeHook = makeForgeHook(loopForge, live.cdp, args, loopOrigin);
+
   persistOnShutdown = () => {
     ledger.flush();
     failed.flush();
+    log('info', forgeSummaryLine(loopForge, forgeHook.driver() ?? undefined));
   };
 
   // F1 (review): ONE supervisor for the whole run. The timekeeper's interval
@@ -619,7 +664,7 @@ async function runChainLoop(args: CliArgs, courseUrl: string, live: { tabId: num
   // the same tab (duplicate resume clicks, racy navigations, misattributed
   // failures). Sequential watch() on a single instance short-circuits via the
   // in-memory done set instead.
-  const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform, log });
+  const timekeeper = new Timekeeper({ tabId: live.tabId, cdp: live.cdp, ws: bridge, jev, platform, log, rate, onTick: forgeHook.onTick });
   await runBatchLoop({
     maxPasses: args.maxPasses ?? 3,
     plan: async () => {
@@ -703,6 +748,7 @@ async function runChainSwarm(args: CliArgs, courseUrl: string, scout: { tabId: n
 
   const swarmOrigin = originOf(courseUrl);
   const swarmForge = resolveForge(args, registry.forCourseUrl(courseUrl), swarmOrigin);
+  const laneForgeHooks = new Map<number, ReturnType<typeof makeForgeHook>>();
   const makeSupervisor = (lane: SwarmLane): Timekeeper => {
     const hook = makeForgeHook(swarmForge, lane.cdp, args, swarmOrigin);
     laneForgeHooks.set(lane.index, hook);
@@ -721,7 +767,6 @@ async function runChainSwarm(args: CliArgs, courseUrl: string, scout: { tabId: n
     });
   };
 
-  const laneForgeHooks = new Map<number, ReturnType<typeof makeForgeHook>>();
   const run = startSwarm({
     lanes,
     courseUrl,
@@ -750,6 +795,10 @@ async function runChainSwarm(args: CliArgs, courseUrl: string, scout: { tabId: n
   };
 
   const summary = await run.done;
+  // Natural completion never passed through stop(): close the lane tabs this
+  // run created (unless --swarm-keep-tabs) so a successful run doesn't leak
+  // N parked tabs into the user's browser. stop() is idempotent.
+  run.stop();
   if (summary.flagged) {
     log('warn', `swarm: run was degraded after the platform warned about concurrent playback (evidence: data/swarm-flag.json, lane ${summary.flagged.laneIndex}) — inspect the account before running swarm again`);
   }
@@ -786,7 +835,12 @@ async function main(): Promise<void> {
   await bridge.start(config.hostPort);
   await bridge.waitHello();
   const tabId = pickTabId(args.url);
-  const cdp = await CdpTab.connect(config.chromeDebugPort, args.url ?? '');
+  // The extension-side tabId and the CDP target must be the SAME page. With
+  // --url both sides match on the substring; without it, anchor the CDP attach
+  // to the picked tab's exact URL — otherwise the two "first page" fallbacks
+  // can silently resolve to different tabs (navigate one, snapshot the other).
+  const pickedUrl = bridge.tabs.find((t) => t.id === tabId)?.url ?? '';
+  const cdp = await CdpTab.connect(config.chromeDebugPort, args.url ?? pickedUrl);
   log('info', `cdp attached to target ${cdp.targetId}`);
 
   const cleanup = (): void => {
@@ -838,7 +892,15 @@ async function main(): Promise<void> {
       // Playback rate and report replay are measured user choices: gate both.
       const rate = (await resolveRunRate(args, { cdp }, queue[0] ?? null)).rate;
       const tabUrl = await cdp.url();
-      const forge = resolveForge(args, registry.forUrl(tabUrl), originOf(tabUrl));
+      // The tab may sit on a course page (chain) rather than a video page
+      // (watch): resolve the plugin through whichever matcher applies, then
+      // through the first queued video's URL as a last resort — otherwise
+      // `chain --forge` would misjudge the gate as 'no-pattern'.
+      const forgeAdapter =
+        registry.forUrl(tabUrl) ??
+        registry.forCourseUrl(tabUrl) ??
+        (queue.length > 0 ? registry.forUrl(platform.videoUrl(queue[0]!)) : null);
+      const forge = resolveForge(args, forgeAdapter, originOf(tabUrl));
       const forgeHook = makeForgeHook(forge, cdp, args, originOf(tabUrl));
       persistOnShutdown = () => log('info', forgeSummaryLine(forge, forgeHook.driver() ?? undefined));
       const timekeeper = new Timekeeper({ tabId, cdp, ws: bridge, jev, platform, log, rate, onTick: forgeHook.onTick });
@@ -861,10 +923,31 @@ async function main(): Promise<void> {
             },
           }
         : undefined;
-      const quizPlugin = registry.forUrl(await cdp.url())?.plugin;
+      // The plugin's quiz knowledge applies on VIDEO, COURSE and QUIZ pages
+      // alike — a /mod/quiz/ attempt matches none of the video/course
+      // patterns, so resolve through the quiz matcher too (M5 §7 was dead
+      // on real quiz pages before this).
+      const pageUrl = await cdp.url();
+      const quizPlugin =
+        (registry.forUrl(pageUrl) ?? registry.forCourseUrl(pageUrl) ?? registry.forQuizUrl(pageUrl))?.plugin;
       const quizHints = quizPlugin?.quiz
         ? quizHintText(quizPlugin.quiz, emptyAppliedHints())
         : undefined;
+      // M5 §7 wiring: the plugin's quiz knowledge is applied to every capture
+      // inside the loop (scope narrowing, nav labels, progress fallback).
+      const pluginQuiz =
+        quizPlugin?.quiz !== undefined && bridge.status().connected
+          ? {
+              quiz: quizPlugin.quiz,
+              evalJson: async (expression: string): Promise<unknown | null> => {
+                try {
+                  return await bridge.evalJson(tabId, expression);
+                } catch {
+                  return null;
+                }
+              },
+            }
+          : undefined;
       const report = await runQuizLoop(
         {
           ws: bridge,
@@ -872,6 +955,7 @@ async function main(): Promise<void> {
           inspect: { ...inspectDeps, l1, ...(quizHints ? { hints: quizHints } : {}) },
           log,
           autoSubmit: config.autoSubmit,
+          ...(pluginQuiz ? { pluginQuiz } : {}),
         },
         tabId,
       );
@@ -881,7 +965,9 @@ async function main(): Promise<void> {
     }
     case 'inspect': {
       const rawCapture = await captureFromWs(wsCaptureTransport(bridge, tabId), { includePageText: true });
-      const inspectPlugin = registry.forUrl(rawCapture.url)?.plugin;
+      const captureUrl = rawCapture.url;
+      const inspectPlugin =
+        (registry.forUrl(captureUrl) ?? registry.forCourseUrl(captureUrl) ?? registry.forQuizUrl(captureUrl))?.plugin;
       const evalJsonForHints = async (expression: string): Promise<unknown | null> => {
         try {
           return await bridge.evalJson(tabId, expression);

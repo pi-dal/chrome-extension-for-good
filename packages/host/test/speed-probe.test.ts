@@ -37,7 +37,9 @@ const sample = (at: number, over: Partial<CreditSample> = {}): CreditSample => (
 function phase(over: Partial<PhaseMeasurement> = {}): PhaseMeasurement {
   return {
     requestedRate: 1,
-    observedRate: 1,
+    // Default: the page obeyed the request. Tests that model a refusing
+    // player override observedRate explicitly.
+    observedRate: over.observedRate ?? over.requestedRate ?? 1,
     samples: [],
     heartbeats: 4,
     creditedPerWall: 1,
@@ -105,6 +107,16 @@ describe('speed-probe math', () => {
     const thin = computeVerdict(phase({ heartbeats: 1 }), phase({ heartbeats: 4, creditedPerWall: 2 }), 2);
     assert.equal(thin.verdict, 'unobservable');
     assert.match(thin.note, /not enough heartbeat responses/);
+
+    // the page never held 2x (player clamped the rate) → unobservable, NOT
+    // 'wallclock' — a 1x fast phase says nothing about the backend
+    const refused = computeVerdict(
+      phase(),
+      phase({ requestedRate: 2, observedRate: 1, creditedPerWall: 1, videoPerWall: 1 }),
+      2,
+    );
+    assert.equal(refused.verdict, 'unobservable');
+    assert.match(refused.note, /never held the requested rate/);
 
     // aborted phase → unobservable with the reason
     const aborted = computeVerdict(phase({ aborted: 'the video is not playing' }), phase(), 2);

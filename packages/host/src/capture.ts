@@ -25,7 +25,7 @@ export interface SnapshotResult {
 }
 
 export interface CaptureTransport {
-  snapshot(req?: { includePageText?: boolean }): Promise<SnapshotResult>;
+  snapshot(req?: { includePageText?: boolean; includeOffscreen?: boolean }): Promise<SnapshotResult>;
   act(action: Action): Promise<{ ok: boolean; url: string }>;
 }
 
@@ -33,6 +33,12 @@ export interface CaptureOptions {
   maxRounds?: number;
   scrollDelta?: number;
   includePageText?: boolean;
+  /**
+   * Keep below-fold elements (default TRUE for captures): the conservation
+   * audit and progress claims cover the whole quiz — a viewport-cropped table
+   * can never satisfy them on a multi-screen page.
+   */
+  includeOffscreen?: boolean;
   now?: () => number;
 }
 
@@ -82,13 +88,14 @@ export async function captureFromWs(
   const maxRounds = opts.maxRounds ?? 4;
   const scrollDelta = opts.scrollDelta ?? 600;
   const includePageText = opts.includePageText ?? true;
+  const includeOffscreen = opts.includeOffscreen ?? true;
   const now = opts.now ?? Date.now;
   const diagnostics: string[] = [];
 
   let best: SnapshotResult | null = null;
   let prevSignature: string | null = null;
   for (let round = 1; round <= maxRounds; round++) {
-    const snap = await transport.snapshot({ includePageText });
+    const snap = await transport.snapshot({ includePageText, includeOffscreen });
     best = snap;
     const signature = tableSignature(snap.table);
     if (signature === prevSignature) break;
@@ -126,8 +133,9 @@ export function assembleCapture(input: {
   const url = input.table.url;
   const parsed = new URL(url);
   // Progress platforms usually print it in the body text; the page title is a
-  // common fallback carrier ("第 1/5 题 小测").
-  const progressSource = input.pageText ?? input.table.title ?? '';
+  // common fallback carrier ("第 1/5 题 小测"). `||` not `??`: an EMPTY
+  // pageText must still fall through to the title.
+  const progressSource = input.pageText || input.table.title || '';
   const capture: PageCapture = {
     captureId: computeCaptureId(url, input.capturedAt),
     url,
@@ -265,7 +273,7 @@ export function listCaptures(corpusDir: string): CorpusIndex['captures'] {
 export interface WsBridgeLike {
   snapshot(
     tabId: number,
-    opts?: { quizOnly?: boolean; includePageText?: boolean },
+    opts?: { quizOnly?: boolean; includePageText?: boolean; includeOffscreen?: boolean },
   ): Promise<{ table: ElementTable; pageText?: string }>;
   act(tabId: number, action: Action): Promise<{ ok: boolean; url: string }>;
 }
@@ -273,7 +281,10 @@ export interface WsBridgeLike {
 export function wsCaptureTransport(ws: WsBridgeLike, tabId: number): CaptureTransport {
   return {
     async snapshot(req) {
-      const res = await ws.snapshot(tabId, { includePageText: req?.includePageText === true });
+      const res = await ws.snapshot(tabId, {
+        includePageText: req?.includePageText === true,
+        includeOffscreen: req?.includeOffscreen === true,
+      });
       return res.pageText !== undefined ? res : { table: res.table };
     },
     act: (action) => ws.act(tabId, action),

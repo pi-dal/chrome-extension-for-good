@@ -11,6 +11,8 @@ import {
 import type { LogFn } from './log.js';
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** Protocol-level liveness: browsers auto-pong ws pings without JS help. */
+const PING_INTERVAL_MS = 30_000;
 
 export interface BridgeStatus {
   connected: boolean;
@@ -41,6 +43,8 @@ type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K>
 export class WsBridge extends EventEmitter {
   private wss: WebSocketServer | null = null;
   private client: WebSocket | null = null;
+  private clientAlive = true;
+  private pingTimer: NodeJS.Timeout | null = null;
   private readonly pending = new Map<string, PendingResolve>();
   private reqCounter = 0;
 
@@ -54,7 +58,11 @@ export class WsBridge extends EventEmitter {
   start(port: number): Promise<void> {
     return new Promise((resolve, reject) => {
       // Loopback only: the bridge can drive the user's logged-in browser and
-      // carries no auth — it must never be reachable from the LAN.
+      // carries no auth — it must never be reachable from the LAN. (A token
+      // handshake was considered and rejected: the CDP port this host also
+      // needs (--remote-debugging-port) grants the same MAIN-world powers to
+      // any local process already, so authenticating only this socket would
+      // be security theatre. Harden the debug port instead if that changes.)
       const wss = new WebSocketServer({ port, host: '127.0.0.1', path: '/extension' });
       wss.on('listening', () => {
         this.log('info', `ws bridge listening on ws://127.0.0.1:${port}/extension`);
@@ -70,11 +78,24 @@ export class WsBridge extends EventEmitter {
     if (this.client && this.client.readyState === WebSocket.OPEN) {
       this.log('warn', 'second extension connection; replacing previous client');
       this.client.close();
+      // Requests in flight were sent on the OLD socket — no response can ever
+      // arrive (the old close handler skips cleanup once client is replaced).
+      // Fail them now instead of stalling every caller for the full timeout.
+      for (const [, entry] of this.pending) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error('extension reconnected'));
+      }
+      this.pending.clear();
     }
     this.client = ws;
+    this.clientAlive = true;
+    this.startPing();
     this.log('info', 'extension connected');
     this.emit('status', { connected: true, extVersion: this.extVersion, tabs: this.tabs } satisfies BridgeStatus);
 
+    ws.on('pong', () => {
+      if (this.client === ws) this.clientAlive = true;
+    });
     ws.on('message', (data: RawData) => this.handleRaw(data));
     ws.on('close', () => {
       if (this.client === ws) {
@@ -83,11 +104,41 @@ export class WsBridge extends EventEmitter {
         // previously connected extension.
         this.tabs = [];
         this.extVersion = '';
+        // Fail in-flight requests immediately — the socket they were sent on
+        // is gone, so no response can ever arrive; waiting out the 15s timer
+        // just stalls every caller.
+        for (const [, entry] of this.pending) {
+          clearTimeout(entry.timer);
+          entry.reject(new Error('extension disconnected'));
+        }
+        this.pending.clear();
         this.log('warn', 'extension disconnected');
         this.emit('status', { connected: false, extVersion: this.extVersion, tabs: this.tabs } satisfies BridgeStatus);
       }
     });
     ws.on('error', (err: Error) => this.log('error', `extension ws error: ${err.message}`));
+  }
+
+  /**
+   * Half-open detection: a suspended service worker or a dead TCP path can
+   * leave readyState=OPEN while nothing flows — messages would vanish until
+   * TCP gives up (minutes). Ping at the protocol level (the browser answers
+   * automatically); terminate a socket that misses one interval so pending
+   * requests fail fast via the close handler instead of timing out.
+   */
+  private startPing(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = setInterval(() => {
+      const ws = this.client;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!this.clientAlive) {
+        this.log('warn', 'extension missed a ping interval — terminating half-open socket');
+        ws.terminate();
+        return;
+      }
+      this.clientAlive = false;
+      ws.ping();
+    }, PING_INTERVAL_MS);
   }
 
   private handleRaw(data: RawData): void {
@@ -164,20 +215,29 @@ export class WsBridge extends EventEmitter {
         reject(new Error(`extension request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`));
       }, REQUEST_TIMEOUT_MS);
       this.pending.set(requestId, { resolve, reject, timer });
-      this.client!.send(JSON.stringify(payload));
+      try {
+        this.client!.send(JSON.stringify(payload));
+      } catch (err) {
+        // send() throws synchronously on a CLOSING socket — don't leave the
+        // pending entry + timer to die of old age.
+        clearTimeout(timer);
+        this.pending.delete(requestId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
   /** Ask the extension for an element-table snapshot of a tab. */
   async snapshot(
     tabId: number,
-    opts: { quizOnly?: boolean; includePageText?: boolean } = {},
+    opts: { quizOnly?: boolean; includePageText?: boolean; includeOffscreen?: boolean } = {},
   ): Promise<{ table: ElementTable; pageText?: string }> {
     const res = await this.request({
       type: 'snapshot_request',
       tabId,
       quizOnly: opts.quizOnly ?? false,
       ...(opts.includePageText ? { includePageText: true } : {}),
+      ...(opts.includeOffscreen ? { includeOffscreen: true } : {}),
     });
     if (res.type !== 'snapshot') throw new Error('unexpected response kind');
     return res.pageText !== undefined ? { table: res.table, pageText: res.pageText } : { table: res.table };
@@ -241,6 +301,8 @@ export class WsBridge extends EventEmitter {
   }
 
   close(): void {
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
     for (const [, entry] of this.pending) {
       clearTimeout(entry.timer);
       entry.reject(new Error('bridge closing'));

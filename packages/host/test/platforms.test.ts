@@ -209,6 +209,18 @@ describe('makeDynamicPlatform', () => {
     assert.equal(platform.videoUrl(11), '/watch/11');
   });
 
+  it('resolves through the COURSE matcher when the tab sits on a course page (scrape path)', async () => {
+    // Regression: resolve() used requireForUrl (video matcher only), so
+    // scrapeCourseVideoIds on a course page threw 'no site plugin matches' —
+    // the whole chain/loop/swarm scrape path was dead on real course pages.
+    const registry = new PlatformRegistry(() => {});
+    registry.usePushedPlugins([plugin({ id: 'demo', courseIdsJs: 'IDS' })]);
+    const platform = makeDynamicPlatform(registry, () => {});
+    const courseTab = fakeTab({ IDS: '[7, 8]' }, 'https://demo.example/catalog');
+    assert.deepEqual(await platform.scrapeCourseVideoIds(courseTab.tab), [7, 8]);
+    assert.equal(platform.videoUrl(3), '/watch/3', 'course-page resolve warms the same plugin for videoUrl');
+  });
+
   it('reports heartbeat patterns from the plugin that owns the current page', async () => {
     const registry = new PlatformRegistry(() => {});
     const platform = makeDynamicPlatform(registry, () => {});

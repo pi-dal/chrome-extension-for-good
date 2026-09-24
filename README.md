@@ -93,6 +93,7 @@ Report replay (`forge`) knowledge is per platform as well: the LMS plugin ships 
 | `speed-policy.json` | measured playback-rate policy per origin (docs/m4-playback-rate.md) |
 | `report-probe.json` | measured report-replay verdicts, per origin (docs/m5-site-plugins.md §6) |
 | `swarm-flag.json` | evidence of a platform concurrency warning (docs/m3-swarm.md) |
+| `corpus/<origin>/<captureId>.json` + `corpus/index.json` | page captures saved by `inspect` (docs/m2-auto-inspect.md §4.1) |
 | `recipes/<origin>.json` | selectors distilled by `inspect --learn` |
 | `plugins/*.json` | local site plugins |
 

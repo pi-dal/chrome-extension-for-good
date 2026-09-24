@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 import type { QuizRecipe } from '@c4g/protocol';
-import { deleteRecipe, loadRecipe, saveRecipe, verifyRecipe } from '../src/recipes.js';
+import { deleteRecipe, loadRecipe, saveRecipe } from '../src/recipes.js';
 
 const tmpDirs: string[] = [];
 after(() => {
@@ -76,56 +76,3 @@ describe('recipe store', () => {
   });
 });
 
-describe('verifyRecipe (live probe against expected counts)', () => {
-  const evalJson = (count: number | null) => async (expression: string) => {
-    if (expression.includes('questionSelector') || expression.includes('div.quiz-item')) return count;
-    void expression;
-    return count;
-  };
-  const probe = evalJson(3);
-
-  it('valid when the question selector matches exactly', async () => {
-    const verdict = await verifyRecipe(probe, recipe('https://exam.example.com'), { questions: 3 });
-    assert.equal(verdict.valid, true, verdict.reasons.join('; '));
-    assert.equal(verdict.counts.questionSelector, 3);
-  });
-
-  it('invalid on over- or under-matching', async () => {
-    const over = await verifyRecipe(evalJson(5), recipe('https://exam.example.com'), { questions: 3 });
-    assert.equal(over.valid, false);
-    assert.ok(over.reasons[0].includes('matched 5'));
-
-    const under = await verifyRecipe(evalJson(2), recipe('https://exam.example.com'), { questions: 3 });
-    assert.equal(under.valid, false);
-  });
-
-  it('invalid when the probe fails entirely', async () => {
-    const verdict = await verifyRecipe(async () => null, recipe('https://exam.example.com'), { questions: 3 });
-    assert.equal(verdict.valid, false);
-    assert.ok(verdict.reasons[0].includes('probe failed'));
-  });
-
-  it('invalid when there is no questionSelector at all', async () => {
-    const verdict = await verifyRecipe(probe, recipe('https://exam.example.com', { questionSelector: undefined }), {
-      questions: 3,
-    });
-    assert.equal(verdict.valid, false);
-    assert.ok(verdict.reasons[0].includes('no questionSelector'));
-  });
-
-  it('optionSelector must cover at least one option per question', async () => {
-    const good = await verifyRecipe(
-      probe,
-      recipe('https://exam.example.com', { optionSelector: 'label.opt' }),
-      { questions: 3 },
-    );
-    assert.equal(good.valid, true);
-
-    const sparse = await verifyRecipe(
-      evalJson(2),
-      recipe('https://exam.example.com', { optionSelector: 'label.opt' }),
-      { questions: 3 },
-    );
-    assert.equal(sparse.valid, false);
-  });
-});

@@ -144,9 +144,10 @@ describe('prefetchAncestrySource (__c4gRef convention)', () => {
     const byIndex = new Map<number, Element>(stems.map((el, i) => [i, el]));
     const evalJson = async (expression: string) => {
       assert.ok(expression.includes('__c4gRef'));
-      const fn = new Function('document', 'window', `return ${expression};`);
-      const fakeWindow = { __c4gRef: (i: number) => byIndex.get(i) ?? null };
-      return JSON.parse(fn(document, fakeWindow));
+      // Mirror content.ts exactly: `new Function('__c4gRef', 'return (expr)')`
+      // — the ref resolver is an injected PARAMETER, not a window property.
+      const fn = new Function('__c4gRef', `return (${expression});`);
+      return fn((i: number) => byIndex.get(i) ?? null);
     };
     const source = await prefetchAncestrySource(evalJson, [0, 1, 2]);
     const derived = deriveSelector([0, 1, 2], source);
@@ -208,16 +209,17 @@ describe('distillRecipe', () => {
     [10, 11, 12, 13, 14, 15].forEach((idx, i) => bySnapshotIndex.set(idx, opts[i]));
     return async (expression: string) => {
       if (expression.includes('querySelectorAll')) {
-        const fn = new Function('document', `return ${expression};`);
-        const value = JSON.parse(fn(document)); // EvalJsonFn contract: parse the JSON envelope
+        const fn = new Function('document', `return (${expression});`);
+        const value = fn(document); // transport already parses the envelope
         // distinguish the two probes by their selector text
         if (expression.includes('p.qtext')) return value === 3 ? stemCount : value;
         if (expression.includes('label.opt')) return optionCount;
         return value;
       }
-      const fn = new Function('document', 'window', `return ${expression};`);
-      const fakeWindow = { __c4gRef: (i: number) => bySnapshotIndex.get(i) ?? null };
-      return JSON.parse(fn(document, fakeWindow));
+      // Mirror content.ts: `__c4gRef` is an injected Function parameter, and
+      // the transport hands the host the expression's own value (no wrapper).
+      const fn = new Function('__c4gRef', `return (${expression});`);
+      return fn((i: number) => bySnapshotIndex.get(i) ?? null);
     };
   }
 

@@ -47,10 +47,13 @@ export const RING_SCRIPT = `(function () {
     if (ring.entries.length > ring.cap) ring.entries.shift();
   }
   var XHR = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
-  if (XHR && !XHR.__c4gPatched) {
+  // Own flag name: site-plugin heartbeat hooks (lms/zhihuishu/icourse163) mark
+  // XHR.__c4gPatched too — sharing it would let whichever patch landed first
+  // silently disable the other's XHR visibility.
+  if (XHR && !XHR.__c4gRingPatched) {
     var openOrig = XHR.open;
     var sendOrig = XHR.send;
-    XHR.__c4gPatched = true;
+    XHR.__c4gRingPatched = true;
     XHR.open = function (m, u) {
       this.__c4gMeta = { m: String(m || 'GET').toUpperCase(), u: String(u || '') };
       return openOrig.apply(this, arguments);

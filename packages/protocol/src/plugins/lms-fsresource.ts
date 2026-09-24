@@ -96,7 +96,7 @@ const COURSE_IDS_JS = `
 export const LMS_FSRESOURCE_PLUGIN: SitePlugin = {
   id: 'lms-fsresource',
   label: 'Moodle video module (mod_fsresource)',
-  match: { video: '/mod/fsresource/view.php', course: '/course/view.php' },
+  match: { video: '/mod/fsresource/view.php', course: '/course/view.php', quizAny: ['/mod/quiz/'] },
   heartbeatUrlPattern: HEARTBEAT_METHOD,
   heartbeatHookJs: HEARTBEAT_HOOK_JS,
   playerStateJs: PLAYER_STATE_JS,

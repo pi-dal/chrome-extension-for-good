@@ -148,6 +148,25 @@ describe('probeReportAcceptance', () => {
     assert.match(verdict.note, /caps credit against real wall-clock/);
   });
 
+  it('calls it ignored when the ack only drifts with natural playback (no false accept)', async () => {
+    // The video keeps PLAYING during the settle window: a backend that ignores
+    // the forged position still shows a small positive delta from natural
+    // credit. Judged by "did it move" that would read 'accepted' — the verdict
+    // must require the delta to cover a share of the forged jump.
+    const page = fakePage({ ack: () => ({ totaltime: 15 }) }); // +5s natural drift, forge ignored
+    const verdict = await probeReportAcceptance({
+      cdp: page.cdp,
+      platform: page.platform,
+      log: () => {},
+      forge: { timeFieldPattern: DEFAULT_TIME_FIELD_PATTERN },
+      position: 90, // forged +80s — a crediting backend would jump ~80, not 5
+      settleMs: 0,
+      sleep: async () => {},
+    });
+    assert.equal(verdict.verdict, 'ignored');
+    assert.equal(verdict.creditedDelta, 5);
+  });
+
   it('calls it rejected when the replay itself fails', async () => {
     const page = fakePage({ replayFails: true });
     const verdict = await probeReportAcceptance({
@@ -205,6 +224,36 @@ describe('ReportProbeStore', () => {
     assert.equal(entry.verdict, 'ignored');
     assert.equal(entry.source, 'driver');
     assert.equal(entry.creditedDelta, undefined);
+  });
+
+  it('getFresh expires stale verdicts in both directions', () => {
+    const file = join(tmp, `probe-fresh-${Math.random().toString(36).slice(2)}.json`);
+    const store = new ReportProbeStore(file);
+    const old = entryFromGiveUp('https://lms.example.com', 'lms-fsresource', 'ancient');
+    old.at = new Date(Date.now() - 40 * 24 * 3_600_000).toISOString(); // 40 days old
+    store.record(old);
+    const fresh = entryFromGiveUp('https://lms.example.com', 'lms-fsresource', 'recent');
+    store.record(fresh);
+    const reloaded = new ReportProbeStore(file);
+    reloaded.load();
+    // The 40-day-old entry was overwritten by the fresh one — check the
+    // boundary directly instead: an expired entry must read as no-evidence.
+    const stale = new ReportProbeStore(file);
+    stale.load();
+    assert.equal(stale.getFresh('https://lms.example.com')?.note, 'recent');
+    // Forge a stale entry by hand: expired verdicts must not arm (or ban) replay.
+    const staleFile = join(tmp, `probe-stale-${Math.random().toString(36).slice(2)}.json`);
+    const staleStore = new ReportProbeStore(staleFile);
+    staleStore.record(old);
+    const reloadedStale = new ReportProbeStore(staleFile);
+    reloadedStale.load();
+    assert.equal(reloadedStale.get('https://lms.example.com')?.note, 'ancient', 'get() still returns the raw entry');
+    assert.equal(reloadedStale.getFresh('https://lms.example.com'), undefined, 'a 40-day-old verdict is no longer evidence');
+    assert.equal(
+      reloadedStale.getFresh('https://lms.example.com', 60 * 24 * 3_600_000)?.note,
+      'ancient',
+      'a wider window still accepts it',
+    );
   });
 });
 
@@ -280,6 +329,27 @@ describe('makeForgeDriver', () => {
     });
     await driver.tick();
     assert.deepEqual(page.applied, [600], 'the reported position is the video duration');
+  });
+
+  it('does not count a natural-heartbeat-sized bump as acceptance', async () => {
+    // A natural heartbeat landing between the before/after reads credits ~one
+    // heartbeat interval (≈10s). With a +60s forged step that must NOT count
+    // as accepted — otherwise the driver never stalls out on a backend that
+    // ignores forging but heartbeats often.
+    const page = fakePage({ ack: (_pos, i) => ({ totaltime: 20 + i * 10 }) }); // +10s per report, forge ignored
+    const driver = makeForgeDriver({
+      cdp: page.cdp,
+      platform: page.platform,
+      log: () => {},
+      forge: { timeFieldPattern: DEFAULT_TIME_FIELD_PATTERN },
+      stepSeconds: 60,
+      maxStalls: 2,
+    });
+    await driver.tick();
+    await driver.tick();
+    const status = driver.status();
+    assert.equal(status.accepted, 0);
+    assert.equal(status.disabled, true, 'two natural-drift ticks must stall the driver out');
   });
 
   it('disables itself when the backend ignores the reports, and records the verdict', async () => {

@@ -1,5 +1,4 @@
 import { WebSocket, type RawData } from 'ws';
-import type { Rect } from '@c4g/protocol';
 
 /**
  * Minimal CDP client for one page target.
@@ -163,7 +162,13 @@ export class CdpConnection {
         reject(new Error(`CDP command '${method}' timed out after ${timeoutMs / 1000}s`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.ws!.send(JSON.stringify({ id, method, params }));
+      try {
+        this.ws!.send(JSON.stringify({ id, method, params }));
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
     });
   }
 
@@ -184,10 +189,21 @@ export class CdpTab {
     const targets = await listTargets(port);
     const candidates = targets.filter((t) => t.type === 'page' && t.webSocketDebuggerUrl);
     if (candidates.length === 0) throw new Error(debugPortHint(port) + ' (no page targets)');
-    const target =
-      candidates.find((t) => urlSubstring !== '' && t.url.includes(urlSubstring)) ??
-      candidates.find((t) => urlSubstring === '' && !t.url.startsWith('devtools://')) ??
-      candidates[0];
+    let target: CdpTargetInfo | undefined;
+    if (urlSubstring !== '') {
+      // An explicit selector that matches nothing must fail loudly — falling
+      // back to an arbitrary page would drive the WRONG tab (clicks, typing,
+      // navigations on a page the operator never chose).
+      target = candidates.find((t) => t.url.includes(urlSubstring));
+      if (!target) {
+        throw new Error(
+          `no CDP page target matched "${urlSubstring}" — refusing an arbitrary tab. ` +
+            `Open pages: ${candidates.map((t) => t.url.slice(0, 60)).join(' | ') || '(none)'}`,
+        );
+      }
+    } else {
+      target = candidates.find((t) => !t.url.startsWith('devtools://')) ?? candidates[0];
+    }
     const conn = await CdpConnection.connect(target.webSocketDebuggerUrl!);
     return new CdpTab(conn, target.id);
   }
@@ -261,41 +277,6 @@ export class CdpTab {
 
   async url(): Promise<string> {
     return this.evaluate<string>('location.href');
-  }
-
-  /**
-   * Trusted input click at the center of a viewport-space rect
-   * (extension snapshots report viewport coords; CDP input expects the same).
-   *
-   * If the page scrolled between snapshot and click, the raw rect would land
-   * on the wrong element — so scroll the point toward viewport center first
-   * and adjust the coordinates by the actually-applied scroll delta, then
-   * verify the element under the cursor before pressing.
-   */
-  async clickAt(rect: Rect): Promise<void> {
-    const cx = Math.round(rect.x + rect.w / 2);
-    const cy = Math.round(rect.y + rect.h / 2);
-    const adjusted = await this.evaluate<{ x: number; y: number; hit: string | null }>(`(function(){
-      const vh = window.innerHeight;
-      const dy = ${cy} - vh / 2;
-      let x = ${cx}, y = ${cy};
-      if (Math.abs(dy) > 2) {
-        const before = window.scrollY;
-        window.scrollBy(0, dy);
-        y = y - (window.scrollY - before);
-      }
-      const el = document.elementFromPoint(x, y);
-      return { x, y, hit: el ? el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') : null };
-    })()`);
-    if (!adjusted || adjusted.hit === null) {
-      throw new Error(`clickAt: no element at viewport point (${cx}, ${cy})`);
-    }
-    const x = Math.round(adjusted.x);
-    const y = Math.round(adjusted.y);
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
-    await this.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await new Promise((r) => setTimeout(r, 40));
-    await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
   }
 
   private send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {

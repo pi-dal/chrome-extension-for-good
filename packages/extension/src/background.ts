@@ -142,7 +142,12 @@ async function connect(): Promise<void> {
     scheduleReconnect();
     return;
   }
-  ws.onopen = () => {
+  // Capture the socket: a stale socket's handlers must never touch state its
+  // replacement already owns. Without the identity check, a socket still in
+  // CLOSING while connect() installs a new one would null the global and kill
+  // the new socket's ping — an open but unreachable bridge (sendRaw dead).
+  const socket = ws;
+  socket.onopen = () => {
     backoffMs = 1_000;
     void setStatus('connected');
     startPing();
@@ -150,16 +155,18 @@ async function connect(): Promise<void> {
     void sendConfigSync('ws-open');
     void sendPluginsSync('ws-open');
   };
-  ws.onmessage = (ev: MessageEvent) => {
+  socket.onmessage = (ev: MessageEvent) => {
     if (typeof ev.data === 'string') void handleHostText(ev.data);
   };
-  ws.onclose = () => {
-    stopPing();
-    ws = null;
-    void setStatus('disconnected');
+  socket.onclose = () => {
+    if (ws === socket) {
+      stopPing();
+      ws = null;
+      void setStatus('disconnected');
+    }
     scheduleReconnect();
   };
-  ws.onerror = () => {
+  socket.onerror = () => {
     // onclose always follows an error; reconnect is scheduled there.
   };
 }
@@ -205,9 +212,13 @@ function handleTabOp(msg: Extract<HostToExt, { type: 'open_tab' | 'close_tab' }>
       } else {
         chrome.tabs.remove(msg.tabId, () => {
           const err = chrome.runtime.lastError;
-          // Closing an already-gone tab is a success for the host's purposes.
-          if (err) fail(err.message ?? 'tabs.remove failed', msg.tabId);
-          else resolve({ type: 'tab_result', requestId: msg.requestId, ok: true, tabId: msg.tabId, url: '' });
+          // Closing an already-gone tab is a success for the host's purposes
+          // (idempotent teardown); anything else is a real failure.
+          if (err && !/no tab with id/i.test(err.message ?? '')) {
+            fail(err.message ?? 'tabs.remove failed', msg.tabId);
+          } else {
+            resolve({ type: 'tab_result', requestId: msg.requestId, ok: true, tabId: msg.tabId, url: '' });
+          }
         });
       }
     } catch (err) {
@@ -327,7 +338,8 @@ chrome.tabs.onCreated.addListener(() => {
   void sendHello('tab-created');
 });
 
-chrome.tabs.onRemoved.addListener(() => {
+chrome.tabs.onRemoved.addListener((tabId) => {
+  lastNavAt.delete(tabId); // bound the nav-rate-limit map to live tabs
   void sendHello('tab-removed');
 });
 

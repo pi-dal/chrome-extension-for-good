@@ -133,6 +133,15 @@ export class PlatformRegistry {
     return plugin ? this.adapter(plugin.id) : null;
   }
 
+  /** Adapter owning a quiz/attempt URL, or null. */
+  forQuizUrl(url: string): PlatformAdapter | null {
+    const plugin = this.plugins.find((p) => {
+      const patterns = [...(p.match.quiz !== undefined ? [p.match.quiz] : []), ...(p.match.quizAny ?? [])];
+      return patterns.some((m) => url.includes(m));
+    });
+    return plugin ? this.adapter(plugin.id) : null;
+  }
+
   /** Same as forUrl but with an actionable error for the operator. */
   requireForUrl(url: string): PlatformAdapter {
     const adapter = this.forUrl(url);
@@ -167,7 +176,13 @@ export interface DynamicPlatform {
 export function makeDynamicPlatform(registry: PlatformRegistry, log: LogFn): DynamicPlatform {
   let last: PlatformAdapter | null = null;
   const resolve = async (tab: PluginTab): Promise<PlatformAdapter> => {
-    const adapter = registry.requireForUrl(await tab.url());
+    const url = await tab.url();
+    // The current page may be a VIDEO page (watch ticks), a COURSE page
+    // (scrapeCourseVideoIds runs there) or a QUIZ page (hints/hook install) —
+    // resolve through whichever matcher owns it. requireForUrl only exists
+    // for its actionable error message.
+    const adapter =
+      registry.forUrl(url) ?? registry.forCourseUrl(url) ?? registry.forQuizUrl(url) ?? registry.requireForUrl(url);
     last = adapter;
     return adapter;
   };

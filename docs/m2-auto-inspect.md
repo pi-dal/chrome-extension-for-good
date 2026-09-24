@@ -24,7 +24,7 @@ Division of labour (invariant): **LLM = discoverer (recall), Jev = judge (precis
 1. **Element conservation**: every quiz-candidate element (all radios/checkboxes, text inputs in the question area, nav candidates) must be accounted for as stem ∪ option ∪ input ∪ nav ∪ explicitly-excluded. Any leftover sends the missing indices back to the LLM for re-enumeration (≤2 rounds); still failing means `conservation.status='fail'` and quiz-loop refuses to answer (report only).
 2. **Dual-channel cross-validation**: L2 and L3 group independently; agreement passes, disagreements go group-by-group to Jev `noul`/`choice`, and confidence < 0.7 lands in `unclassified` (fail-safe).
 3. **Progress conservation**: extract the platform's self-reported progress (`progressClaim`) and reconcile it against the visible question count; a mismatch triggers a hunting loop (scroll/expand/paginate) and re-enumeration.
-4. **Read-back after action**: every answer action re-snapshots to verify `checked`/`value` took effect (M1 `actSafe` plus a new read-back assertion).
+4. **Read-back after action**: every answer action verifies `checked`/`value` took effect — via `__c4gRef` eval probes on the acted-on indices (a fresh snapshot would replace the executor's ref cache and misalign every later click — the M1 index-epoch problem), with a full-table snapshot as the fallback for extensions without eval support. For multi-selects the check is "the options we chose are checked", never "all boxes" — a proper-subset answer is answered, and retrying clicks only the still-unchecked options so a retry can never toggle a correct selection back off.
 
 ## 3. Protocol additions (packages/protocol — additive only, never breaking)
 
@@ -70,7 +70,7 @@ interface InspectionSession {   // cross-page merge result
 }
 ```
 
-- `snapshot_request` gains an optional `includePageText?: boolean`; `snapshot` gains an optional `pageText?: string`.
+- `snapshot_request` gains optional `includePageText?: boolean` and `includeOffscreen?: boolean`; `snapshot` gains an optional `pageText?: string`. `includeOffscreen` keeps elements below the fold — captures request it by default (multi-screen quizzes need whole-page enumeration for progress conservation); the viewport crop stays the default only for the small resume-path tables.
 - `Action` gains `{ op: 'eval'; expression: string }`: host → extension, executed in the isolated world (DOM queries). **Grammar policy**: expressions may only come from host code constants; model-derived selectors must pass a syntax allow-list (no `;`, `//`, backticks; length ≤300) and be JSON-escaped before interpolation into `document.querySelectorAll(...)`; results are JSON-serialized and capped at 64KB.
 - `action_result` gains an optional `value?: unknown` (eval actions only; 64KB JSON cap enforced on both sides). The extension executes the expression in the isolated world and binds `__c4gRef(i)` to the live element cached for snapshot index i. (review F5)
 - No other protocol changes. Conservation candidate detection keeps using the `role` field (radio/checkbox/textbox); no new fields.
@@ -79,6 +79,7 @@ interface InspectionSession {   // cross-page merge result
 
 ### 4.1 capture.ts (online capture)
 - `captureFromWs(ws, tabId, opts)`: convergence loop (snapshot → scroll to bottom → element count stable, or ≤4 rounds) → assemble `PageCapture`; `pageText` via `op:'eval'` reading `document.body.innerText` (≤32KB); `progressClaim` extracted by `regex.ts` ("第 x/y 题", "Question x of y", "共 N 题", "x/y"); empty on failure so the LLM can take over.
+  - Snapshot scope note: `snapshot_request` carries `includeOffscreen?: boolean`; `captureFromWs` requests it by default so captures cover the WHOLE page — a multi-screen quiz must enumerate every question to pass progress conservation. The viewport crop remains the default only for the small resume-path tables (timekeeper/Jev).
 - `saveCapture/loadCapture`: persist to `data/corpus/<origin>/<captureId>.json` plus `data/corpus/index.json` (runtime corpus, **gitignored**).
 - Capture quality gate: conservation is pre-checked at the entrance (an incomplete table is marked defective and never reaches inspect).
 
@@ -89,7 +90,7 @@ function inspectPage(capture: PageCapture, deps: InspectDeps): Promise<Inspectio
 function inspectSession(captures: PageCapture[], deps: InspectDeps): Promise<InspectionSession>
 ```
 - `heuristic.ts` (L2): consecutive radios sharing a name = a single-choice group; checkbox groups = multi-choice; the nearest preceding text element (≥6 chars, or ending in ?/？/：) = the stem; an existing Moodle `quizSlot` hint is trusted directly (`source:'hint'`).
-  - **Known deviation (review F8, pending protocol support)**: grouping is currently by "consecutive same role" without checking the DOM `name` attribute, because `ElementInfo` does not carry it. Two adjacent questions with contiguous selectors can be merged into one group, and conservation/Jev cannot catch a *consistent* dual-channel error. Tighten once the protocol carries `htmlName?: string`.
+  - **F8 resolved**: `ElementInfo.htmlName` now carries the DOM `name` attribute, and a contiguous radio run is split when the name changes — two adjacent questions whose second stem was never captured can no longer merge into one group. The split-off run lands in `unassigned` (no stem to claim it) for the conservation auditor / LLM feedback rather than being silently merged.
 - `llm.ts` (L3 enumeration): input is the numbered element table (+ `pageText` fallback); the system prompt forces JSON only — `{questions:[{stemIndex,optionIndices[],inputIndices[]}],navIndices[],excludedIndices[]}`; tolerant parsing reuses the solver's `extractJson`; **validation**: indices exist, groups are disjoint; failure re-feeds the diff for re-enumeration (≤2 rounds); `enabled` shares the solver switch.
 - `arbitrate.ts`: every L2/L3 disagreement goes to Jev (`choice`/`noul`); in dry-run all disagreements land in `unclassified`.
 - `conservation.ts`: candidate universe = role ∈ {radio,checkbox} ∪ elements with `quizSlot` ∪ textboxes inside the question area; ownership checks, round control, final `unaccounted` list.

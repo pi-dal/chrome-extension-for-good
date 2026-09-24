@@ -2,11 +2,13 @@
  * L2 structural heuristic grouper (docs/m2-auto-inspect.md §4.2).
  *
  * Platform-free quiz grouping over an element table: consecutive
- * radio/checkbox runs are option groups, the nearest preceding free-text
- * element is the stem, trailing textboxes become answer inputs, and buttons
- * are classified as quiz nav or explicitly excluded. When the snapshot
- * carries quizSlot hints (e.g. Moodle .que), the hints are trusted directly
- * (source 'hint', confidence 1).
+ * radio/checkbox runs are option groups (a radio run is also split when the
+ * DOM `name` changes — F8: two questions' radios can be contiguous in the
+ * table when the second stem was never captured), the nearest preceding
+ * free-text element is the stem, trailing textboxes become answer inputs,
+ * and buttons are classified as quiz nav or explicitly excluded. When the
+ * snapshot carries quizSlot hints (e.g. Moodle .que), the hints are trusted
+ * directly (source 'hint', confidence 1).
  *
  * The grouper is deliberately conservative: quiz-candidate controls it cannot
  * place (e.g. an option run with no stem) are returned in `unassigned` for
@@ -71,14 +73,15 @@ function looksLikeStem(el: ElementInfo): boolean {
 
 function isAnswered(options: ElementInfo[], inputs: ElementInfo[]): boolean {
   if (options.length > 0) {
-    // Single-choice radios: exactly one selection counts as answered;
-    // multi-select checkboxes: every box ticked (M3 integration fix — an
-    // every()-over-mixed-options check made radio groups permanently
-    // "unanswered").
+    // Single-choice radios and multi-select checkboxes alike: a question
+    // counts as answered once ANY of its options is selected — the platform
+    // marks a multi-select answered on the first tick. Requiring every box
+    // would misread proper-subset answers as unanswered, and re-answering
+    // would toggle the existing selections back off (review H3).
     const radios = options.filter((el) => el.role === 'radio');
     const checkboxes = options.filter((el) => el.role === 'checkbox');
     const radiosOk = radios.length === 0 || radios.some((el) => el.checked === true);
-    const boxesOk = checkboxes.length === 0 || checkboxes.every((el) => el.checked === true);
+    const boxesOk = checkboxes.length === 0 || checkboxes.some((el) => el.checked === true);
     return radiosOk && boxesOk;
   }
   if (inputs.length > 0) return inputs.every((el) => (el.value ?? '').trim() !== '');
@@ -109,6 +112,7 @@ function groupByHints(table: ElementTable): HeuristicResult {
   const questions: HeuristicQuestion[] = [];
   const navIndices: number[] = [];
   const excluded: Array<{ index: number; reason: string }> = [];
+  const unassigned: number[] = [];
   let current: HeuristicQuestion | null = null;
 
   for (const el of table.elements) {
@@ -127,10 +131,14 @@ function groupByHints(table: ElementTable): HeuristicResult {
         break;
       }
       case 'option':
-        current?.optionIndices.push(el.index);
+        // An option before any question stem is an ORPHAN — surface it to the
+        // conservation/LLM feedback path instead of vanishing silently.
+        if (current) current.optionIndices.push(el.index);
+        else unassigned.push(el.index);
         break;
       case 'answer-input':
-        current?.inputIndices.push(el.index);
+        if (current) current.inputIndices.push(el.index);
+        else unassigned.push(el.index);
         break;
       case 'nav':
         navIndices.push(el.index);
@@ -153,7 +161,7 @@ function groupByHints(table: ElementTable): HeuristicResult {
       .filter((el): el is ElementInfo => el !== undefined);
     q.answered = isAnswered(opts, inputs);
   }
-  return { questions, navIndices, excluded, unassigned: [] };
+  return { questions, navIndices, excluded, unassigned };
 }
 
 /** Structural path: runs of option controls, nearest preceding text stem. */
@@ -187,8 +195,24 @@ function groupStructurally(table: ElementTable): HeuristicResult {
       continue;
     }
     if (isOptionControl(el)) {
-      if (cur !== undefined && prev !== undefined && isOptionControl(prev)) {
-        cur.optionIndices.push(el.index);
+      // A contiguous option run continues the current group only when it is
+      // the same kind of control AND — for radios — shares the DOM name.
+      // A name change mid-run means the next question's options are adjacent
+      // with no captured stem between them (F8: the stem is a plain text node
+      // outside the interactive selector, so the table never saw it).
+      const continuesGroup =
+        cur !== undefined &&
+        prev !== undefined &&
+        isOptionControl(prev) &&
+        prev.role === el.role &&
+        !(
+          el.role === 'radio' &&
+          el.htmlName !== undefined &&
+          prev.htmlName !== undefined &&
+          el.htmlName !== prev.htmlName
+        );
+      if (continuesGroup) {
+        cur!.optionIndices.push(el.index);
         continue;
       }
       if (lastStem !== null && !stemConsumed) {
@@ -206,6 +230,10 @@ function groupStructurally(table: ElementTable): HeuristicResult {
         continue;
       }
       unassigned.push(el.index);
+      // The split-off run has no stem to claim it — close the open group so
+      // the NEXT option of the same run lands in unassigned too instead of
+      // being appended to the previous question.
+      cur = undefined;
       continue;
     }
     if (isInputControl(el)) {

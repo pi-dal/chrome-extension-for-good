@@ -62,6 +62,12 @@ function cachedRefs(): (HTMLElement | null)[] | null {
     cache = null;
     return null;
   }
+  // Sliding expiry: the cache's real epoch is "until the next snapshot
+  // replaces it" — the TTL is only an idle-safety bound. A multi-question
+  // quiz round (LLM solve latency + paced clicks) easily exceeds 30s and
+  // must not lose its index epoch mid-round; detached elements are still
+  // caught by the isConnected check at the action site.
+  cache.ts = Date.now();
   return cache.refs;
 }
 
@@ -244,6 +250,9 @@ function toInfo(el: HTMLElement, rect: DOMRect): ElementInfo {
   const value = valueOf(el);
   if (value !== undefined) info.value = value;
   if (quizSlot) info.quizSlot = quizSlot;
+  // DOM `name` attribute (radio groups share it) — the F8 grouping signal.
+  const htmlName = el.getAttribute('name');
+  if (htmlName) info.htmlName = htmlName;
   return info;
 }
 
@@ -270,11 +279,15 @@ function buildEntries(includeOffscreen: boolean): SnapEntry[] {
   return out;
 }
 
-function snapshot(quizOnly: boolean): { table: ElementTable; refs: (HTMLElement | null)[] } {
+function snapshot(
+  quizOnly: boolean,
+  includeOffscreen: boolean,
+): { table: ElementTable; refs: (HTMLElement | null)[] } {
   // Quiz snapshots keep below-fold elements: the executor clicks via
   // el.click(), which works offscreen, and long Moodle pages put questions
-  // far below the fold.
-  let entries = buildEntries(quizOnly);
+  // far below the fold. includeOffscreen does the same for full captures —
+  // a multi-screen quiz must enumerate every question, not just the viewport.
+  let entries = buildEntries(quizOnly || includeOffscreen);
   if (quizOnly) {
     entries = entries.filter((e) => e.info.quizSlot !== undefined || e.info.role === 'button');
   }
@@ -337,8 +350,10 @@ function doClick(el: HTMLElement): void {
   const r = el.getBoundingClientRect();
   const cx = r.left + r.width / 2;
   const cy = r.top + r.height / 2;
+  // Real press sequence: pointerdown → mousedown → pointerup → mouseup → click.
   firePointer(el, 'pointerdown', cx, cy);
   fireMouse(el, 'mousedown', cx, cy);
+  firePointer(el, 'pointerup', cx, cy);
   fireMouse(el, 'mouseup', cx, cy);
   el.click();
 }
@@ -453,7 +468,7 @@ chrome.runtime.onMessage.addListener((raw: unknown, _sender, sendResponse: (resp
     }
     if (msg.type === 'snapshot_request') {
       try {
-        const { table, refs } = snapshot(msg.quizOnly === true);
+        const { table, refs } = snapshot(msg.quizOnly === true, msg.includeOffscreen === true);
         remember(refs);
         // includePageText: body text for the LLM enumeration fallback channel
         // (design §3); truncated to the protocol's 32KB budget.

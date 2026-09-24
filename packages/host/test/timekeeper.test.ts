@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -112,7 +112,7 @@ describe('Timekeeper', () => {
     tk.setQueue([101, 102]);
     const outcome = await tk.tick();
     assert.deepEqual(outcome, { kind: 'navigate', id: 101 });
-    assert.deepEqual(h.navigations, ['/mod/fsresource/view.php?id=101']);
+    assert.deepEqual(h.navigations, ['https://lms.example.com/mod/fsresource/view.php?id=101']);
     tk.stop();
   });
 
@@ -207,7 +207,7 @@ describe('Timekeeper', () => {
     assert.equal(second.kind, 'resume');
     const third = await tk.tick();
     assert.equal(third.kind, 'navigate');
-    assert.deepEqual(h.navigations, ['/mod/fsresource/view.php?id=102']);
+    assert.deepEqual(h.navigations, ['https://lms.example.com/mod/fsresource/view.php?id=102']);
     const persisted = JSON.parse(readFileSync(h.deps.dataFile, 'utf8')) as { queue: number[]; done: number[] };
     assert.deepEqual(persisted.done, [101]);
     tk.stop();
@@ -335,6 +335,22 @@ describe('Timekeeper', () => {
     tk.stop();
   });
 
+  it('above 1x with unreadable server state falls back to the client clock — not instant-done', async () => {
+    // Regression: `serverFinished || !serverReadable` marked the video done on
+    // its FIRST tick whenever the platform exposed no progress/totaltime —
+    // the fallback must be the client clock, not an unconditional finish.
+    const h = makeHarness({ playing: true, currentTime: 50, duration: 300, totaltime: null, progress: null });
+    h.deps.rate = 2;
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101, 102]);
+    const first = await tk.tick();
+    assert.equal(first.kind, 'none', 'unreadable server state must not complete the video early');
+    h.setPlayer({ currentTime: 299 });
+    const second = await tk.tick();
+    assert.deepEqual(second, { kind: 'navigate', id: 102 });
+    tk.stop();
+  });
+
   it('detects a generic heartbeat candidate once on platforms without a known pattern', async () => {
     const h = makeHarness({ playing: true, totaltime: 200, currentTime: 200 });
     const base = 1_700_000_000_000;
@@ -370,8 +386,27 @@ describe('Timekeeper', () => {
     const solverish = rf(new URL('../src/quiz-loop.ts', import.meta.url), 'utf8');
     assert.ok(!/XMLHttpRequest|\.ajax\(|fetch\(/.test(solverish), 'quiz loop must not issue raw HTTP');
     // Above 1x the client clock races the ledger: only the server's ack may
-    // close a video out.
-    assert.match(tkSource, /this\.targetRate > 1\.001 \? serverFinished/, 'finish detection must defer to the server above 1x');
+    // close a video out. And the unreadable-server fallback must still require
+    // the client clock — `!serverReadable` alone must never finish a video.
+    assert.match(tkSource, /this\.targetRate > 1\.001[\s\S]*?serverFinished/, 'finish detection must defer to the server above 1x');
+    assert.match(tkSource, /!serverReadable && clientFinished/, 'the unreadable-server fallback must still require the client clock');
+  });
+});
+
+describe('Timekeeper already-done page', () => {
+  it('chains forward from an already-credited video page instead of re-recording it', async () => {
+    // The tab sits on video 101 which the ledger already credited (persisted
+    // done-set). The tick must chain to the next queued id — not record a
+    // second outcome, not re-log a finish.
+    const h = makeHarness({ playing: false, currentTime: 5999, duration: 6000 });
+    writeFileSync(h.deps.dataFile!, JSON.stringify({ queue: [], done: [101] }));
+    const tk = new Timekeeper(h.deps);
+    tk.setQueue([101, 102]); // 101 is filtered out by the done merge
+    const outcome = await tk.tick();
+    assert.deepEqual(outcome, { kind: 'navigate', id: 102 });
+    assert.deepEqual(h.navigations, ['https://lms.example.com/mod/fsresource/view.php?id=102']);
+    assert.equal(tk.runSummary().length, 0, 'no outcome may be recorded for an already-done video');
+    tk.stop();
   });
 });
 

@@ -103,26 +103,31 @@ export class JeDriver {
     }
     const rendered = renderTable(table);
     const targetCriteria = Object.fromEntries(table.elements.map((el) => [String(el.index), null]));
-    const response = await this.client.systemOne({
-      state: { goal, table: rendered },
-      questions: {
-        operation: choice('Which single operation best advances the goal?', {
-          CLICK: null,
-          TYPE: null,
-          SELECT: null,
-          SCROLL_DOWN: null,
-          SCROLL_UP: null,
-          WAIT: null,
-          DONE: null,
-          BLOCKED: null,
-        }),
-        // Speculative: only executes when operation === CLICK/TYPE/SELECT.
-        target: choice(
-          'Which element index should this operation act on? Answer with the [N] index.',
-          targetCriteria as Record<string, null>,
-        ),
+    // Bounded wait: a hung LLM call would otherwise stall the supervision tick
+    // forever (and, behind the tick-in-flight guard, the whole timekeeper).
+    const response = await this.client.systemOne(
+      {
+        state: { goal, table: rendered },
+        questions: {
+          operation: choice('Which single operation best advances the goal?', {
+            CLICK: null,
+            TYPE: null,
+            SELECT: null,
+            SCROLL_DOWN: null,
+            SCROLL_UP: null,
+            WAIT: null,
+            DONE: null,
+            BLOCKED: null,
+          }),
+          // Speculative: only executes when operation === CLICK/TYPE/SELECT.
+          target: choice(
+            'Which element index should this operation act on? Answer with the [N] index.',
+            targetCriteria as Record<string, null>,
+          ),
+        },
       },
-    });
+      { timeout: 45_000 },
+    );
     const operation = response.answers.operation.choice as JevOperation;
     const targetLabel = response.answers.target.choice as string;
     const targetIndex = /^\d+$/.test(targetLabel) ? Number(targetLabel) : undefined;

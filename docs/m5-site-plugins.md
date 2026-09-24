@@ -16,6 +16,7 @@ interface SitePlugin {
   match: {                         // URL-substring matching
     video: string; videoAny?: string[];      // platforms with several player URLs
     course?: string; courseAny?: string[];
+    quiz?: string; quizAny?: string[];       // quiz/attempt pages → quiz hints apply there
   };
   heartbeatUrlPattern?: string;    // known heartbeat fragment → fast path, skips generic detection
   heartbeatHookJs: string;         // MAIN world, idempotent: record the last heartbeat request/response
@@ -47,10 +48,10 @@ Validation rules (enforced by the shared protocol parser, used by both the exten
 | Item | Rule |
 |---|---|
 | Count | ≤16 plugins per sync |
-| JS fields | each ≤16KB; `label` ≤128B; URL/pattern fields ≤512B; total ≤256KB |
+| JS fields | each ≤16KB; `label` ≤128B; match/pattern fields ≤256B (`videoUrlTemplate` ≤512B); total ≤256KB |
 | `idPattern` | must compile and contain a capture group |
 | `videoUrlTemplate` | must contain `{id}` |
-| `match.videoAny` / `courseAny` | non-empty array, ≤256B each, ≤8 entries |
+| `match.videoAny` / `courseAny` / `quizAny` | non-empty array, ≤256B each, ≤8 entries |
 | `forge` | needs at least one of `timeFieldPattern`, `replayJs`, `note`; `replayJs` ≤16KB |
 | `forge.timeFieldPattern` | must compile as a RegExp |
 | `quiz` | must not be empty; `navLabels` non-empty, ≤8 entries, ≤64B each |

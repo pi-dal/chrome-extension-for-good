@@ -31,30 +31,36 @@ export function extractJson(raw: string): Record<string, unknown> | undefined {
   text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
   const direct = tryParse(text);
   if (direct !== undefined) return direct;
-  const start = text.indexOf('{');
-  if (start === -1) return undefined;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) {
-        const candidate = text.slice(start, i + 1);
-        const parsed = tryParse(candidate);
-        if (parsed !== undefined) return parsed;
-        break;
+  // Scan for balanced {...} blocks; a block that fails to parse (a stray
+  // `{x}` in prose) does NOT end the search — the real JSON may come later.
+  let start = text.indexOf('{');
+  while (start !== -1) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    let closed = false;
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') inString = true;
+      else if (ch === '{') depth++;
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          const parsed = tryParse(text.slice(start, i + 1));
+          if (parsed !== undefined) return parsed;
+          closed = true;
+          break;
+        }
       }
     }
+    if (!closed) break; // unbalanced tail — nothing parseable remains
+    start = text.indexOf('{', start + 1);
   }
   return undefined;
 }
@@ -114,8 +120,16 @@ export class QuizSolver {
       const parsed = raw !== undefined ? extractJson(raw) : undefined;
       if (parsed && Array.isArray(parsed['indices'])) {
         const known = new Set(options.map((o) => o.index));
-        const indices = (parsed['indices'] as unknown[])
+        let indices = (parsed['indices'] as unknown[])
           .filter((n): n is number => typeof n === 'number' && known.has(n));
+        // Single-choice contract is exactly one index: a model returning
+        // several would have the loop click each radio in turn — the LAST
+        // click wins, so the answer becomes whichever index happened to be
+        // last, and read-back can never confirm the rest. Keep the first.
+        if (!multi && indices.length > 1) {
+          this.log('warn', `solver returned ${indices.length} indices for a single-choice question — keeping the first`);
+          indices = indices.slice(0, 1);
+        }
         if (indices.length > 0) return { indices };
       }
       this.log('warn', `solver reply not parseable (attempt ${attempt + 1})`, raw?.slice(0, 120));

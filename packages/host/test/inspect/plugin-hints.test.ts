@@ -33,6 +33,9 @@ function pageTable(): ElementTable {
       { index: 5, role: 'button', name: '保存', tag: 'button', rect: { x: 0, y: 100, w: 10, h: 10 } },
       { index: 6, role: 'button', name: '提交', tag: 'button', rect: { x: 0, y: 120, w: 10, h: 10 } },
       { index: 7, role: 'button', name: '返回课程', tag: 'button', rect: { x: 0, y: 140, w: 10, h: 10 } },
+      // A quiz-candidate control OUTSIDE the container — scoping must drop it
+      // (unlike nav candidates, which are always retained).
+      { index: 8, role: 'radio', name: 'stray', tag: 'input', rect: { x: 0, y: 160, w: 10, h: 10 } },
     ],
   };
 }
@@ -63,7 +66,7 @@ function evalBySelector(map: Record<string, number[] | 'error'>, log: LogFn = ()
         if (hit[1] === 'error') throw new Error('probe exploded');
         // the transport hands the host the builder's raw value: an array of 0/1
         const inside = new Set(hit[1]);
-        return [0, 1, 2, 3, 4, 5, 6, 7].map((i) => (inside.has(i) ? 1 : 0));
+        return [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => (inside.has(i) ? 1 : 0));
       }
       const text = Object.entries(map).find(([selector]) => expression.includes(selector));
       if (!text || text[1] === 'error') return null;
@@ -75,21 +78,25 @@ function evalBySelector(map: Record<string, number[] | 'error'>, log: LogFn = ()
 describe('applyQuizScope', () => {
   const quiz: SitePluginQuiz = { rootSelector: '#quiz-region' };
 
-  it('keeps only the elements inside the quiz container', async () => {
+  it('keeps inside elements plus outside nav candidates; drops outside quiz controls', async () => {
     const l = logs();
     const deps = evalBySelector({ '#quiz-region': [1, 2, 3, 4, 5, 6] }, l.log);
     const { capture: scoped, applied } = await applyQuizScope(capture(), quiz, { evalJson: deps.evalJson, log: l.log });
-    assert.deepEqual(scoped.table.elements.map((e) => e.index), [1, 2, 3, 4, 5, 6]);
+    // 0 (link) and 7 (button) sit outside the scope but are retained: submit/
+    // save/next bars commonly live outside the quiz root (Moodle .submitbtns)
+    // and dropping them would silently kill pagination + the submit gate.
+    // 8 (a stray radio outside) is dropped — it is a quiz control, not nav.
+    assert.deepEqual(scoped.table.elements.map((e) => e.index), [0, 1, 2, 3, 4, 5, 6, 7]);
     assert.equal(applied.scoped, true);
-    assert.match(applied.scopeNote ?? '', /kept 6\/8/);
-    assert.match(applied.diagnostics[0]!, /kept 6\/8/);
+    assert.match(applied.scopeNote ?? '', /kept 8\/9/);
+    assert.match(applied.scopeNote ?? '', /2 nav candidate\(s\) outside scope retained/);
   });
 
   it('keeps the whole page when the selector matches nothing', async () => {
     const l = logs();
     const deps = evalBySelector({ '#quiz-region': [] }, l.log);
     const { capture: scoped, applied } = await applyQuizScope(capture(), quiz, { evalJson: deps.evalJson, log: l.log });
-    assert.equal(scoped.table.elements.length, 8, 'never silently produces an empty quiz');
+    assert.equal(scoped.table.elements.length, 9, 'never silently produces an empty quiz');
     assert.equal(applied.scoped, false);
     assert.match(applied.scopeNote ?? '', /matched no snapshot element/);
     assert.ok(l.lines.some((line) => line.includes('matched no snapshot element')));
@@ -99,7 +106,7 @@ describe('applyQuizScope', () => {
     const l = logs();
     const deps = evalBySelector({ '#quiz-region': 'error' }, l.log);
     const { capture: scoped, applied } = await applyQuizScope(capture(), quiz, { evalJson: deps.evalJson, log: l.log });
-    assert.equal(scoped.table.elements.length, 8);
+    assert.equal(scoped.table.elements.length, 9);
     assert.equal(applied.scoped, false);
     assert.match(applied.scopeNote ?? '', /probe failed/);
   });
@@ -108,7 +115,7 @@ describe('applyQuizScope', () => {
     const l = logs();
     const deps = evalBySelector({}, l.log);
     const { capture: scoped, applied } = await applyQuizScope(capture(), {}, { evalJson: deps.evalJson, log: l.log });
-    assert.equal(scoped.table.elements.length, 8);
+    assert.equal(scoped.table.elements.length, 9);
     assert.equal(applied.scoped, false);
     assert.deepEqual(deps.asked, []);
   });
@@ -117,7 +124,7 @@ describe('applyQuizScope', () => {
     const l = logs();
     const deps = evalBySelector({}, l.log);
     const { capture: scoped, applied } = await applyQuizScope(capture(), { rootSelector: 'div{color:red}' }, { evalJson: deps.evalJson, log: l.log });
-    assert.equal(scoped.table.elements.length, 8);
+    assert.equal(scoped.table.elements.length, 9);
     assert.match(applied.scopeNote ?? '', /probe failed/);
   });
 });
@@ -167,10 +174,19 @@ describe('mergeNavLabels', () => {
 });
 
 describe('readProgressHint', () => {
-  it('reads the platform progress widget when the capture had no claim', async () => {
-    const deps = evalBySelector({ '.num-bfjd span': [0] });
+  it('reads an x/y progress widget when the capture had no claim', async () => {
+    const deps = { evalJson: async (): Promise<unknown | null> => '第 3/10 题' };
     const claim = await readProgressHint({ progressSelector: '.num-bfjd span' }, deps);
-    assert.deepEqual(claim, { raw: '已完成 37.5%', current: 37.5, total: 100 });
+    assert.deepEqual(claim, { raw: '第 3/10 题', current: 3, total: 10 });
+  });
+
+  it('refuses a single-number widget (a percentage is not an x/y claim)', async () => {
+    // "已完成 37.5%" must NOT become {current: 37.5, total: 100} — the
+    // progress-conservation gate compares `total` against the QUESTION count,
+    // so a percent claim would hunt forever and stop the run.
+    const deps = evalBySelector({ '.num-bfjd span': [0] }); // returns '已完成 37.5%'
+    const claim = await readProgressHint({ progressSelector: '.num-bfjd span' }, deps);
+    assert.equal(claim, null);
   });
 
   it('returns null without a selector, on a failed probe, or on a numberless widget', async () => {

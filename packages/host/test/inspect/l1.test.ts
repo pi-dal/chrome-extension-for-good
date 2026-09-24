@@ -37,11 +37,11 @@ describe('L1 recipe confirmation (review F5c)', () => {
 
   it('membership probe evaluates to an ARRAY and survives the transport', () => {
     const expr = buildMembershipProbeExpression('.answer', [1, 2, 3]);
-    const window_ = {
-      __c4gRef: (i: number) => ({ matches: (sel: string) => sel === '.answer' && (i === 1 || i === 3) }),
-    };
-    const fn = new Function('window', `return (${expr});`);
-    const value = fn(window_);
+    // Mirror content.ts: `__c4gRef` is an injected parameter, not a window
+    // property (the old `window.__c4gRef` convention was never implemented).
+    const c4gRef = (i: number) => ({ matches: (sel: string) => sel === '.answer' && (i === 1 || i === 3) });
+    const fn = new Function('__c4gRef', `return (${expr});`);
+    const value = fn(c4gRef);
     // Regression: a JSON.stringify wrapper here made Array.isArray(flags) false
     // in production, so L1 recipe confirmation could never succeed.
     assert.deepEqual(value, [1, 0, 1]);

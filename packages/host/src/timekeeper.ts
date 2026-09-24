@@ -143,6 +143,11 @@ export class Timekeeper {
   private timer: NodeJS.Timeout | null = null;
   private readonly dataFile: string;
   private running = false;
+  // A tick is a chain of CDP round-trips (url → state → snapshot → act →
+  // navigate); on a sluggish page it can outlive the interval. Without this
+  // guard the timer stacks overlapping ticks — double navigations, duplicate
+  // summary entries, recordOutcome firing twice for one finish.
+  private tickInFlight = false;
   private ringInstalled = false;
   private genericHeartbeatReported = false;
   // --- stall recovery + per-video accounting
@@ -170,6 +175,22 @@ export class Timekeeper {
   /** Video page URL for a resource id, via the platform's plugin when it has one. */
   private videoUrl(id: number): string {
     return this.deps.platform.videoUrl?.(id) ?? videoUrl(id);
+  }
+
+  /**
+   * Navigate to a video id. Plugin `videoUrlTemplate`s are RELATIVE
+   * ('/mod/fsresource/view.php?id={id}') — resolve them against the current
+   * page URL so Page.navigate always receives an absolute target.
+   */
+  private async navigateToVideo(id: number): Promise<void> {
+    const template = this.videoUrl(id);
+    let target = template;
+    try {
+      target = new URL(template, await this.deps.cdp.url()).toString();
+    } catch {
+      // keep the raw template — an absolute one passes through unchanged
+    }
+    await this.deps.cdp.navigate(target);
   }
 
   /** Resource id of the current page, via the platform's plugin when it has one. */
@@ -215,6 +236,7 @@ export class Timekeeper {
 
   /** Start supervising; queue is a list of fsresourceids in playback order. */
   start(queue: number[]): void {
+    if (this.running) return; // a second start would leak the first interval
     this.setQueue(queue);
     this.running = true;
     const interval = this.deps.intervalMs ?? 20_000;
@@ -303,6 +325,16 @@ export class Timekeeper {
 
   /** One supervision step. Public for tests; start() drives it on an interval. */
   async tick(): Promise<TickOutcome> {
+    if (this.tickInFlight) return { kind: 'none', detail: 'tick in flight' };
+    this.tickInFlight = true;
+    try {
+      return await this.tickBody();
+    } finally {
+      this.tickInFlight = false;
+    }
+  }
+
+  private async tickBody(): Promise<TickOutcome> {
     const { cdp, platform, log } = this.deps;
     const url = await cdp.url();
 
@@ -313,7 +345,7 @@ export class Timekeeper {
         return { kind: 'idle', detail: 'queue empty — all videos done' };
       }
       log('info', `timekeeper: navigating to video ${next}`);
-      await cdp.navigate(this.videoUrl(next));
+      await this.navigateToVideo(next);
       await this.preparePage();
       this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
@@ -321,6 +353,21 @@ export class Timekeeper {
 
     const state = await platform.readPlayerState(cdp);
     const currentId = this.idFromUrl(url);
+
+    // Sitting on an already-credited video (queue re-armed after a drain-stop,
+    // or a duplicate id in the queue): chain forward instead of recording the
+    // same outcome twice and re-logging a finish.
+    if (currentId !== null && this.done.has(currentId)) {
+      const next = this.queue.find((id) => !this.done.has(id) && !this.gaveUp.has(id));
+      if (next === undefined) {
+        this.stop();
+        return { kind: 'idle', detail: 'queue drained' };
+      }
+      await this.navigateToVideo(next);
+      await this.preparePage();
+      this.resetPlaybackWatch(true);
+      return { kind: 'navigate', id: next };
+    }
 
     // Rate guard: hold the page at the configured rate. The host never invents
     // a rate — above 1x the run only happens because the operator asked for it
@@ -427,10 +474,15 @@ export class Timekeeper {
     const serverReadable = state.progress !== null || state.totaltime !== null;
     // At 1x the client clock is a faithful proxy for what the ledger sees.
     // Above 1x it is NOT — the player races ahead of the account, so a video is
-    // only "finished" when the server's own ack says so (unreadable → fall back
-    // to the client clock rather than hanging forever).
+    // only "finished" when the server's own ack says so. When the server state
+    // is unreadable we fall back to the client clock rather than hanging
+    // forever — but the client clock must still say finished; marking done on
+    // `!serverReadable` alone would complete every video on its first tick.
     const finished =
-      state.duration > 0 && (this.targetRate > 1.001 ? serverFinished || !serverReadable : clientFinished || serverFinished);
+      state.duration > 0 &&
+      (this.targetRate > 1.001
+        ? serverFinished || (!serverReadable && clientFinished)
+        : clientFinished || serverFinished);
     if (finished && currentId !== null) {
       log('info', `timekeeper: video ${currentId} finished (currentTime=${state.currentTime.toFixed(0)}s/${state.duration.toFixed(0)}s, totaltime=${state.totaltime ?? '?'})`);
       this.done.add(currentId);
@@ -443,7 +495,7 @@ export class Timekeeper {
         this.stop();
         return { kind: 'idle', detail: 'queue drained' };
       }
-      await cdp.navigate(this.videoUrl(next));
+      await this.navigateToVideo(next);
       await this.preparePage();
       this.resetPlaybackWatch(true);
       return { kind: 'navigate', id: next };
@@ -459,7 +511,13 @@ export class Timekeeper {
    */
   private async preparePage(): Promise<void> {
     const { cdp, platform, log, onPageReady } = this.deps;
-    await platform.installHeartbeatHook(cdp);
+    // The hook is read-only observability — its failure must not skip the lane
+    // policy (a lane that never re-arms keep-alive stalls into an abandon).
+    try {
+      await platform.installHeartbeatHook(cdp);
+    } catch (err) {
+      log('warn', `timekeeper: heartbeat hook install failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     if (!onPageReady) return;
     try {
       await onPageReady();
@@ -495,7 +553,7 @@ export class Timekeeper {
       this.stop();
       return { kind: 'idle', detail: 'queue drained (with failures)' };
     }
-    await cdp.navigate(this.videoUrl(next));
+    await this.navigateToVideo(next);
     await this.preparePage();
     this.resetPlaybackWatch(true);
     return { kind: 'abandon', id };

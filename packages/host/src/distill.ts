@@ -9,11 +9,7 @@
  * elements, never run.
  */
 
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { InspectionResult, PageCapture, QuizRecipe } from '@c4g/protocol';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // selector grammar policy (§3)
@@ -133,20 +129,26 @@ export function deriveSelector(
 // ---------------------------------------------------------------------------
 
 /**
- * The extension's eval scope is expected to expose `window.__c4gRef(i)` → the
- * live element cached for snapshot index i (integration lane wires this from
- * the content-script ref cache). Returns null-based results per index when the
- * convention is absent, so callers degrade instead of failing.
+ * The extension's eval scope injects `__c4gRef(i)` as a function parameter →
+ * the live element cached for snapshot index i (content.ts wires it from the
+ * content-script ref cache; it is NOT a window property — `window.__c4gRef`
+ * is undefined in the isolated world). Returns null-based results per index
+ * when the convention is absent, so callers degrade instead of failing.
  */
 export function ancestryProbeExpression(elementIndices: number[]): string {
   const idx = JSON.stringify(elementIndices);
+  // CONTRACT: the expression evaluates to an ARRAY of chains (root → … →
+  // element per index). The transport already serializes the page's return
+  // value — a JSON.stringify wrapper here would hand the consumer a string
+  // and silently break ancestry prefetch (same contract as
+  // buildMembershipProbeExpression in inspect/l1.ts).
   return (
-    `JSON.stringify(${idx}.map(function(i){` +
-    `var el=(window.__c4gRef&&window.__c4gRef(i))||null;if(!el)return null;` +
+    `${idx}.map(function(i){` +
+    `var el=(typeof __c4gRef==="function"?__c4gRef(i):null)||null;if(!el)return null;` +
     `var out=[],n=el,d=0;while(n&&d<${DEFAULT_MAX_DEPTH}){` +
     `out.push({tag:n.tagName.toLowerCase(),classes:Array.from(n.classList||[])});` +
     `n=n.parentElement;d++;}` +
-    `out.reverse();return out;}))`  // contract order: root → … → element
+    `out.reverse();return out;})`
   );
 }
 
@@ -249,8 +251,4 @@ export async function distillRecipe(input: {
     updatedAt: Date.now(),
   };
   return { recipe, questionSelector: q.selector, optionSelector };
-}
-
-export function defaultRecipesDir(): string {
-  return resolve(HERE, '..', 'data', 'recipes');
 }

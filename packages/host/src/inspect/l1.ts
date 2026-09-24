@@ -32,7 +32,7 @@ export function buildMembershipProbeExpression(selector: string, indices: number
   const safe = assertSafeSelector(selector);
   return (
     `${JSON.stringify(indices)}.map(function(i){` +
-    `var el=(window.__c4gRef&&window.__c4gRef(i))||null;` +
+    `var el=(typeof __c4gRef==="function"?__c4gRef(i):null)||null;` +
     `return el&&el.matches?el.matches(${JSON.stringify(safe)})?1:0:0;})`
   );
 }
@@ -74,7 +74,9 @@ export async function confirmRecipe(
           return { ok: false, reason: `option selector matched ${String(oCount)} elements, expected ${options.length}` };
         }
         const oFlags = await evalJson(buildMembershipProbeExpression(recipe.optionSelector, options));
-        if (!Array.isArray(oFlags) || oFlags.some((f) => f !== 1)) {
+        // Length matters as much as content: a truncated probe returning
+        // [1,1] for 5 options must NOT pass — every option must be verified.
+        if (!Array.isArray(oFlags) || oFlags.length !== options.length || oFlags.some((f) => f !== 1)) {
           return { ok: false, reason: 'option membership mismatch' };
         }
       }

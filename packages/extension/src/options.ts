@@ -94,12 +94,13 @@ function renderCatalog(): void {
 }
 
 async function load(): Promise<void> {
-  const stored = await storageGet(['port', ...ENDPOINT_FIELDS, STORAGE.pluginsJson]);
+  const stored = await storageGet([STORAGE.hostPort, 'port', ...ENDPOINT_FIELDS, STORAGE.pluginsJson]);
   for (const field of ENDPOINT_FIELDS) {
     (document.getElementById(field) as HTMLInputElement).value =
       typeof stored[field] === 'string' ? (stored[field] as string) : '';
   }
-  const port = stored['port'];
+  // hostPort is the canonical key; 'port' is the legacy alias older saves used.
+  const port = stored[STORAGE.hostPort] ?? stored['port'];
   (document.getElementById('port') as HTMLInputElement).value =
     typeof port === 'number' && port > 0 ? String(port) : '8765';
 
@@ -113,9 +114,11 @@ async function load(): Promise<void> {
       say('The stored site-plugin JSON is currently invalid — fix it and save', false);
     }
   } else {
-    // First run: seed the box with the built-in LMS plugin as a template.
-    pluginsBox.value = pluginsToText(BUILTIN_PLUGINS);
-    say('Seeded with the built-in catalog (saving makes it the extension-side plugin set)', true);
+    // Empty box = built-ins only. Deliberately NOT seeded with the catalog:
+    // saving a seeded copy would PIN today's built-in definitions as pushed
+    // plugins, shadowing every future built-in fix (same ids → pushed wins).
+    // The catalog below is for copying single entries from.
+    say('Empty = built-in plugins only · copy a catalog entry below to customize', true);
   }
 }
 
@@ -138,11 +141,11 @@ on('save', 'click', async () => {
     say(`Site-plugin validation failed: ${err instanceof Error ? err.message : String(err)}`, false);
     return;
   }
-  const items: Record<string, unknown> = { port: p, [STORAGE.pluginsJson]: pluginsBox.value.trim() };
+  const items: Record<string, unknown> = { [STORAGE.hostPort]: p, [STORAGE.pluginsJson]: pluginsBox.value.trim() };
   for (const field of ENDPOINT_FIELDS) {
     items[field] = (document.getElementById(field) as HTMLInputElement).value.trim();
   }
-  await storageSet({ ...items, hostPort: p });
+  await storageSet(items);
   // background listens to storage.onChanged and pushes config_sync + plugins_sync
   say(`Saved and pushed to the host (${plugins.length} site plugin(s))`, true);
 });
